@@ -170,3 +170,5 @@ SQLite data is stored at `data\depositproof.sqlite3`. Uploaded files are stored
 under `uploads\`, and generated reports under `reports\`. Do not deploy this
 demo publicly with real rental documents without adding authentication,
 authorization, retention/deletion controls, and secure storage.
+#   D e p o s i t A I - - - 3 I d i o t s  
+ 
