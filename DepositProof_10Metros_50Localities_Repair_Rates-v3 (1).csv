@@ -1,0 +1,251 @@
+﻿City,Locality / Area,Category,Min Price (₹),Max Price (₹)
+Bengaluru,HSR Layout,Painting / Repainting,8800,15400
+Bengaluru,HSR Layout,Cleaning,2000,3500
+Bengaluru,HSR Layout,Plumbing,400,950
+Bengaluru,HSR Layout,Electrical Repairs,300,650
+Bengaluru,HSR Layout,Furniture / Carpentry,750,2000
+Bengaluru,Koramangala,Painting / Repainting,9700,16950
+Bengaluru,Koramangala,Cleaning,2200,3850
+Bengaluru,Koramangala,Plumbing,400,1050
+Bengaluru,Koramangala,Electrical Repairs,300,750
+Bengaluru,Koramangala,Furniture / Carpentry,850,2200
+Bengaluru,Whitefield,Painting / Repainting,9000,15700
+Bengaluru,Whitefield,Cleaning,2000,3600
+Bengaluru,Whitefield,Plumbing,400,950
+Bengaluru,Whitefield,Electrical Repairs,300,650
+Bengaluru,Whitefield,Furniture / Carpentry,800,2000
+Bengaluru,Indiranagar,Painting / Repainting,9850,17250
+Bengaluru,Indiranagar,Cleaning,2200,3950
+Bengaluru,Indiranagar,Plumbing,450,1050
+Bengaluru,Indiranagar,Electrical Repairs,300,750
+Bengaluru,Indiranagar,Furniture / Carpentry,850,2200
+Bengaluru,Jayanagar,Painting / Repainting,9250,16150
+Bengaluru,Jayanagar,Cleaning,2100,3700
+Bengaluru,Jayanagar,Plumbing,400,1000
+Bengaluru,Jayanagar,Electrical Repairs,300,700
+Bengaluru,Jayanagar,Furniture / Carpentry,800,2100
+Mumbai,Andheri West,Painting / Repainting,11350,19850
+Mumbai,Andheri West,Cleaning,2550,4550
+Mumbai,Andheri West,Plumbing,500,1200
+Mumbai,Andheri West,Electrical Repairs,350,850
+Mumbai,Andheri West,Furniture / Carpentry,1000,2550
+Mumbai,Powai,Painting / Repainting,11900,20800
+Mumbai,Powai,Cleaning,2650,4750
+Mumbai,Powai,Plumbing,500,1250
+Mumbai,Powai,Electrical Repairs,350,900
+Mumbai,Powai,Furniture / Carpentry,1050,2650
+Mumbai,Bandra West,Painting / Repainting,12950,22700
+Mumbai,Bandra West,Cleaning,2900,5200
+Mumbai,Bandra West,Plumbing,550,1400
+Mumbai,Bandra West,Electrical Repairs,400,950
+Mumbai,Bandra West,Furniture / Carpentry,1150,2900
+Mumbai,Thane West,Painting / Repainting,9700,17000
+Mumbai,Thane West,Cleaning,2200,3900
+Mumbai,Thane West,Plumbing,450,1050
+Mumbai,Thane West,Electrical Repairs,300,750
+Mumbai,Thane West,Furniture / Carpentry,850,2200
+Mumbai,Lower Parel,Painting / Repainting,12750,22300
+Mumbai,Lower Parel,Cleaning,2850,5100
+Mumbai,Lower Parel,Plumbing,550,1350
+Mumbai,Lower Parel,Electrical Repairs,400,950
+Mumbai,Lower Parel,Furniture / Carpentry,1100,2850
+Delhi NCR,Gurgaon Sector 56,Painting / Repainting,10100,17650
+Delhi NCR,Gurgaon Sector 56,Cleaning,2250,4050
+Delhi NCR,Gurgaon Sector 56,Plumbing,450,1050
+Delhi NCR,Gurgaon Sector 56,Electrical Repairs,300,750
+Delhi NCR,Gurgaon Sector 56,Furniture / Carpentry,900,2250
+Delhi NCR,Noida Sector 62,Painting / Repainting,9100,15950
+Delhi NCR,Noida Sector 62,Cleaning,2050,3650
+Delhi NCR,Noida Sector 62,Plumbing,400,950
+Delhi NCR,Noida Sector 62,Electrical Repairs,300,700
+Delhi NCR,Noida Sector 62,Furniture / Carpentry,800,2050
+Delhi NCR,South Extension,Painting / Repainting,11050,19300
+Delhi NCR,South Extension,Cleaning,2500,4400
+Delhi NCR,South Extension,Plumbing,500,1150
+Delhi NCR,South Extension,Electrical Repairs,350,850
+Delhi NCR,South Extension,Furniture / Carpentry,950,2500
+Delhi NCR,Dwarka Sector 12,Painting / Repainting,9100,15950
+Delhi NCR,Dwarka Sector 12,Cleaning,2050,3650
+Delhi NCR,Dwarka Sector 12,Plumbing,400,950
+Delhi NCR,Dwarka Sector 12,Electrical Repairs,300,700
+Delhi NCR,Dwarka Sector 12,Furniture / Carpentry,800,2050
+Delhi NCR,DLF Phase 5,Painting / Repainting,11500,20150
+Delhi NCR,DLF Phase 5,Cleaning,2600,4600
+Delhi NCR,DLF Phase 5,Plumbing,500,1200
+Delhi NCR,DLF Phase 5,Electrical Repairs,350,850
+Delhi NCR,DLF Phase 5,Furniture / Carpentry,1000,2600
+Pune,Wakad,Painting / Repainting,7200,12650
+Pune,Wakad,Cleaning,1600,2900
+Pune,Wakad,Plumbing,300,750
+Pune,Wakad,Electrical Repairs,250,550
+Pune,Wakad,Furniture / Carpentry,650,1600
+Pune,Baner,Painting / Repainting,8000,13950
+Pune,Baner,Cleaning,1800,3200
+Pune,Baner,Plumbing,350,850
+Pune,Baner,Electrical Repairs,250,600
+Pune,Baner,Furniture / Carpentry,700,1800
+Pune,Viman Nagar,Painting / Repainting,8200,14350
+Pune,Viman Nagar,Cleaning,1850,3300
+Pune,Viman Nagar,Plumbing,350,850
+Pune,Viman Nagar,Electrical Repairs,250,600
+Pune,Viman Nagar,Furniture / Carpentry,700,1850
+Pune,Kharadi,Painting / Repainting,7750,13550
+Pune,Kharadi,Cleaning,1750,3100
+Pune,Kharadi,Plumbing,350,800
+Pune,Kharadi,Electrical Repairs,250,600
+Pune,Kharadi,Furniture / Carpentry,700,1750
+Pune,Kothrud,Painting / Repainting,7600,13300
+Pune,Kothrud,Cleaning,1700,3050
+Pune,Kothrud,Plumbing,350,800
+Pune,Kothrud,Electrical Repairs,250,550
+Pune,Kothrud,Furniture / Carpentry,650,1700
+Hyderabad,Gachibowli,Painting / Repainting,8400,14700
+Hyderabad,Gachibowli,Cleaning,1900,3350
+Hyderabad,Gachibowli,Plumbing,350,900
+Hyderabad,Gachibowli,Electrical Repairs,250,650
+Hyderabad,Gachibowli,Furniture / Carpentry,750,1900
+Hyderabad,Hitec City,Painting / Repainting,8800,15400
+Hyderabad,Hitec City,Cleaning,2000,3500
+Hyderabad,Hitec City,Plumbing,400,950
+Hyderabad,Hitec City,Electrical Repairs,300,650
+Hyderabad,Hitec City,Furniture / Carpentry,750,2000
+Hyderabad,Kondapur,Painting / Repainting,8000,14000
+Hyderabad,Kondapur,Cleaning,1800,3200
+Hyderabad,Kondapur,Plumbing,350,850
+Hyderabad,Kondapur,Electrical Repairs,250,600
+Hyderabad,Kondapur,Furniture / Carpentry,700,1800
+Hyderabad,Banjara Hills,Painting / Repainting,9600,16800
+Hyderabad,Banjara Hills,Cleaning,2150,3850
+Hyderabad,Banjara Hills,Plumbing,400,1000
+Hyderabad,Banjara Hills,Electrical Repairs,300,700
+Hyderabad,Banjara Hills,Furniture / Carpentry,850,2150
+Hyderabad,Jubilee Hills,Painting / Repainting,9750,17100
+Hyderabad,Jubilee Hills,Cleaning,2200,3900
+Hyderabad,Jubilee Hills,Plumbing,450,1050
+Hyderabad,Jubilee Hills,Electrical Repairs,300,750
+Hyderabad,Jubilee Hills,Furniture / Carpentry,850,2200
+Chennai,Velachery,Painting / Repainting,7600,13300
+Chennai,Velachery,Cleaning,1700,3050
+Chennai,Velachery,Plumbing,350,800
+Chennai,Velachery,Electrical Repairs,250,550
+Chennai,Velachery,Furniture / Carpentry,650,1700
+Chennai,T. Nagar,Painting / Repainting,8500,14900
+Chennai,T. Nagar,Cleaning,1900,3400
+Chennai,T. Nagar,Plumbing,350,900
+Chennai,T. Nagar,Electrical Repairs,250,650
+Chennai,T. Nagar,Furniture / Carpentry,750,1900
+Chennai,Adyar,Painting / Repainting,8350,14650
+Chennai,Adyar,Cleaning,1900,3350
+Chennai,Adyar,Plumbing,350,900
+Chennai,Adyar,Electrical Repairs,250,650
+Chennai,Adyar,Furniture / Carpentry,750,1900
+Chennai,Anna Nagar,Painting / Repainting,8200,14350
+Chennai,Anna Nagar,Cleaning,1850,3300
+Chennai,Anna Nagar,Plumbing,350,850
+Chennai,Anna Nagar,Electrical Repairs,250,600
+Chennai,Anna Nagar,Furniture / Carpentry,700,1850
+Chennai,OMR,Painting / Repainting,7450,13050
+Chennai,OMR,Cleaning,1700,3000
+Chennai,OMR,Plumbing,350,800
+Chennai,OMR,Electrical Repairs,250,550
+Chennai,OMR,Furniture / Carpentry,650,1700
+Kolkata,Salt Lake,Painting / Repainting,7150,12500
+Kolkata,Salt Lake,Cleaning,1600,2850
+Kolkata,Salt Lake,Plumbing,300,750
+Kolkata,Salt Lake,Electrical Repairs,200,550
+Kolkata,Salt Lake,Furniture / Carpentry,600,1600
+Kolkata,New Town,Painting / Repainting,6950,12150
+Kolkata,New Town,Cleaning,1550,2750
+Kolkata,New Town,Plumbing,300,750
+Kolkata,New Town,Electrical Repairs,200,500
+Kolkata,New Town,Furniture / Carpentry,600,1550
+Kolkata,Ballygunge,Painting / Repainting,7800,13700
+Kolkata,Ballygunge,Cleaning,1750,3150
+Kolkata,Ballygunge,Plumbing,350,850
+Kolkata,Ballygunge,Electrical Repairs,250,600
+Kolkata,Ballygunge,Furniture / Carpentry,700,1750
+Kolkata,Park Street,Painting / Repainting,8000,14050
+Kolkata,Park Street,Cleaning,1800,3200
+Kolkata,Park Street,Plumbing,350,850
+Kolkata,Park Street,Electrical Repairs,250,600
+Kolkata,Park Street,Furniture / Carpentry,700,1800
+Kolkata,Garia,Painting / Repainting,6250,10950
+Kolkata,Garia,Cleaning,1400,2500
+Kolkata,Garia,Plumbing,250,650
+Kolkata,Garia,Electrical Repairs,200,450
+Kolkata,Garia,Furniture / Carpentry,550,1400
+Ahmedabad,SG Highway,Painting / Repainting,6950,12150
+Ahmedabad,SG Highway,Cleaning,1550,2750
+Ahmedabad,SG Highway,Plumbing,300,750
+Ahmedabad,SG Highway,Electrical Repairs,200,500
+Ahmedabad,SG Highway,Furniture / Carpentry,600,1550
+Ahmedabad,Bodakdev,Painting / Repainting,7600,13350
+Ahmedabad,Bodakdev,Cleaning,1700,3050
+Ahmedabad,Bodakdev,Plumbing,350,800
+Ahmedabad,Bodakdev,Electrical Repairs,250,550
+Ahmedabad,Bodakdev,Furniture / Carpentry,650,1700
+Ahmedabad,Satellite,Painting / Repainting,7350,12850
+Ahmedabad,Satellite,Cleaning,1650,2950
+Ahmedabad,Satellite,Plumbing,300,800
+Ahmedabad,Satellite,Electrical Repairs,250,550
+Ahmedabad,Satellite,Furniture / Carpentry,650,1650
+Ahmedabad,Prahlad Nagar,Painting / Repainting,7150,12500
+Ahmedabad,Prahlad Nagar,Cleaning,1600,2850
+Ahmedabad,Prahlad Nagar,Plumbing,300,750
+Ahmedabad,Prahlad Nagar,Electrical Repairs,200,550
+Ahmedabad,Prahlad Nagar,Furniture / Carpentry,600,1600
+Ahmedabad,Vastrapur,Painting / Repainting,6650,11650
+Ahmedabad,Vastrapur,Cleaning,1500,2650
+Ahmedabad,Vastrapur,Plumbing,300,700
+Ahmedabad,Vastrapur,Electrical Repairs,200,500
+Ahmedabad,Vastrapur,Furniture / Carpentry,600,1500
+Jaipur,Vaishali Nagar,Painting / Repainting,6550,11400
+Jaipur,Vaishali Nagar,Cleaning,1450,2600
+Jaipur,Vaishali Nagar,Plumbing,300,700
+Jaipur,Vaishali Nagar,Electrical Repairs,200,500
+Jaipur,Vaishali Nagar,Furniture / Carpentry,550,1450
+Jaipur,Malviya Nagar,Painting / Repainting,6400,11200
+Jaipur,Malviya Nagar,Cleaning,1450,2550
+Jaipur,Malviya Nagar,Plumbing,300,700
+Jaipur,Malviya Nagar,Electrical Repairs,200,500
+Jaipur,Malviya Nagar,Furniture / Carpentry,550,1450
+Jaipur,C Scheme,Painting / Repainting,7350,12900
+Jaipur,C Scheme,Cleaning,1650,2950
+Jaipur,C Scheme,Plumbing,300,800
+Jaipur,C Scheme,Electrical Repairs,250,550
+Jaipur,C Scheme,Furniture / Carpentry,650,1650
+Jaipur,Raja Park,Painting / Repainting,6900,12100
+Jaipur,Raja Park,Cleaning,1550,2750
+Jaipur,Raja Park,Plumbing,300,750
+Jaipur,Raja Park,Electrical Repairs,200,500
+Jaipur,Raja Park,Furniture / Carpentry,600,1550
+Jaipur,Mansarovar,Painting / Repainting,5900,10300
+Jaipur,Mansarovar,Cleaning,1300,2350
+Jaipur,Mansarovar,Plumbing,250,650
+Jaipur,Mansarovar,Electrical Repairs,200,450
+Jaipur,Mansarovar,Furniture / Carpentry,500,1300
+Kochi,Kakkanad,Painting / Repainting,6250,11000
+Kochi,Kakkanad,Cleaning,1400,2500
+Kochi,Kakkanad,Plumbing,250,650
+Kochi,Kakkanad,Electrical Repairs,200,450
+Kochi,Kakkanad,Furniture / Carpentry,550,1400
+Kochi,Edappally,Painting / Repainting,6550,11400
+Kochi,Edappally,Cleaning,1450,2600
+Kochi,Edappally,Plumbing,300,700
+Kochi,Edappally,Electrical Repairs,200,500
+Kochi,Edappally,Furniture / Carpentry,550,1450
+Kochi,Marine Drive,Painting / Repainting,7350,12900
+Kochi,Marine Drive,Cleaning,1650,2950
+Kochi,Marine Drive,Plumbing,300,800
+Kochi,Marine Drive,Electrical Repairs,250,550
+Kochi,Marine Drive,Furniture / Carpentry,650,1650
+Kochi,Vyttila,Painting / Repainting,6700,11750
+Kochi,Vyttila,Cleaning,1500,2700
+Kochi,Vyttila,Plumbing,300,700
+Kochi,Vyttila,Electrical Repairs,200,500
+Kochi,Vyttila,Furniture / Carpentry,600,1500
+Kochi,Aluva,Painting / Repainting,5750,10100
+Kochi,Aluva,Cleaning,1300,2300
+Kochi,Aluva,Plumbing,250,600
+Kochi,Aluva,Electrical Repairs,200,450
+Kochi,Aluva,Furniture / Carpentry,500,1300
