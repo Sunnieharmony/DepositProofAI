@@ -48,24 +48,47 @@ class AppWorkflowTests(unittest.TestCase):
 
         self.assertFalse(welcome["visible"])
         self.assertTrue(application["visible"])
-        self.assertEqual(len(step_state), 6)
+        self.assertEqual(len(step_state), 9)
         self.assertEqual([item["visible"] for item in step_state[:4]], [True, False, False, False])
-        self.assertIn("Audit case", step_state[4])
-        self.assertIn('aria-current="step"', step_state[4])
-        self.assertEqual(step_state[5], "")
+        self.assertEqual(step_state[4]["variant"], "secondary")
+        self.assertIn("dp-step--active", step_state[4]["elem_classes"])
+        self.assertEqual(step_state[5]["variant"], "secondary")
+        self.assertIn("dp-step--upcoming", step_state[5]["elem_classes"])
+        self.assertEqual(step_state[8], "")
 
-    def test_mobile_navigation_returns_all_workflow_outputs(self):
-        state = app._navigate_to_step("Evidence")
+    def test_navigation_opens_sections_without_a_case(self):
+        evidence_state = app._navigate_to_step(2, None, None)
+        self.assertEqual([item["visible"] for item in evidence_state[:4]], [False, True, False, False])
+        self.assertIn("Create or select an audit case", evidence_state[8])
+        self.assertIn("still explore", evidence_state[8])
+        self.assertIn("dp-step--active", evidence_state[5]["elem_classes"])
 
-        self.assertEqual(len(state), 6)
-        self.assertEqual([item["visible"] for item in state[:4]], [False, True, False, False])
-        self.assertIn("Evidence", state[4])
-        self.assertEqual(state[5], "")
+        findings_state = app._navigate_to_step(3, None, None)
+        self.assertEqual([item["visible"] for item in findings_state[:4]], [False, False, True, False])
+        self.assertIn("dp-step--active", findings_state[6]["elem_classes"])
 
-    def test_case_continue_requires_saved_case_and_preserves_case_state(self):
+        case_state = app._navigate_to_step(1, None, None)
+        self.assertEqual([item["visible"] for item in case_state[:4]], [True, False, False, False])
+        self.assertEqual(case_state[8], "")
+
+    def test_report_navigation_opens_without_a_completed_audit(self):
+        report_state = app._navigate_to_step(4, None, "")
+        self.assertEqual([item["visible"] for item in report_state[:4]], [False, False, False, True])
+        self.assertIn("Run the evidence audit", report_state[8])
+        self.assertIn("dp-step--active", report_state[7]["elem_classes"])
+
+        completed_report_state = app._navigate_to_step(4, self.case_id, "# Audit report")
+        self.assertEqual(completed_report_state[8], "")
+
+    def test_continue_navigation_does_not_require_a_saved_case(self):
         missing_state = app._continue_from_case(None)
-        self.assertEqual([item["visible"] for item in missing_state[:4]], [True, False, False, False])
-        self.assertIn("Create or select an audit case", missing_state[5])
+        self.assertEqual([item["visible"] for item in missing_state[:4]], [False, True, False, False])
+        self.assertIn("Create or select an audit case", missing_state[8])
+        findings_state_without_case = app._continue_from_evidence(None)
+        self.assertEqual(
+            [item["visible"] for item in findings_state_without_case[:4]],
+            [False, False, True, False],
+        )
 
         with app.db() as con:
             con.execute(
@@ -93,14 +116,34 @@ class AppWorkflowTests(unittest.TestCase):
             [False, False, True, False],
         )
 
-    def test_final_report_requires_completed_audit_output(self):
-        blocked_state = app._continue_from_review("")
-        self.assertEqual([item["visible"] for item in blocked_state[:4]], [False, False, True, False])
-        self.assertIn("Run the evidence audit", blocked_state[5])
+    def test_case_summary_displays_complete_id_without_model_configuration(self):
+        with patch.object(app, "llm_is_configured", return_value=True):
+            case_id, summary, _ = app.create_case(
+                "Visible case", 10000, 1000, 9000, None, None,
+            )
 
-        report_state = app._continue_from_review("# Audit report")
+        self.assertIn(
+            f'<h3>Case created: <span class="dp-case-id">{case_id}</span></h3>',
+            summary,
+        )
+        self.assertIn("AI-assisted analysis is available.", summary)
+        for internal_detail in ("gemini", "flash", "vision:", "language:", "API key", "sentence-transformers"):
+            self.assertNotIn(internal_detail.lower(), summary.lower())
+
+        with patch.object(app, "llm_is_configured", return_value=False):
+            status = app.ai_status_markdown()
+        self.assertIn("AI-assisted analysis is unavailable", status)
+        self.assertIn("rules-based assessment remains available", status)
+        self.assertNotIn("API key", status)
+
+    def test_final_report_navigation_shows_guidance_without_blocking(self):
+        report_state = app._continue_from_review("")
+        self.assertEqual([item["visible"] for item in report_state[:4]], [False, False, False, True])
+        self.assertIn("Run the evidence audit", report_state[8])
+
+        completed_report_state = app._continue_from_review("# Audit report")
         self.assertEqual(
-            [item["visible"] for item in report_state[:4]],
+            [item["visible"] for item in completed_report_state[:4]],
             [False, False, False, True],
         )
 
@@ -211,7 +254,7 @@ class AppWorkflowTests(unittest.TestCase):
             markdown, pdf_path, _ = app.run_audit(self.case_id)
             app.run_audit(self.case_id)
 
-        self.assertIn("Repair-price benchmark (context only; does not change the classification)", markdown)
+        self.assertIn("### Repair-price benchmark — context only", markdown)
         self.assertIn("Sample repair-rate data only", markdown)
         self.assertTrue(Path(pdf_path).is_file())
         pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(pdf_path).pages)
@@ -381,7 +424,7 @@ class AppWorkflowTests(unittest.TestCase):
         )
         self.assertNotIn("**Mode:** LLM-assisted", markdown)
         self.assertIn("Validated LLM explanation; classification determined by evidence rules", markdown)
-        self.assertIn("**LLM suggestion (not authoritative):** Supported", markdown)
+        self.assertNotIn("AI suggestion", markdown)
         self.assertIn("Rules-based fallback after hosted LLM assessment failed", markdown)
         self.assertIn("Gemini quota exhausted", markdown)
         self.assertIn("| Observed feature / location | Move-in condition | Move-out condition | Interpretation |", markdown)
@@ -390,17 +433,167 @@ class AppWorkflowTests(unittest.TestCase):
         self.assertIn("this is not a calibrated confidence score.", markdown)
         self.assertIn("it was not a deduction assessment", markdown)
         self.assertIn("No linked usable photo observation is available", markdown)
+        self.assertNotIn("Photo comparison", markdown)
         self.assertNotIn("Rules-based assessment of the uploaded evidence only.", markdown)
 
         pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(pdf_path).pages)
         self.assertIn("Assessment modes by deduction", pdf_text)
         self.assertIn("LLM explanation with rules-engine classification", pdf_text)
         self.assertIn("rules-based fallback after LLM failure", pdf_text)
-        self.assertIn("Observed feature /", pdf_text)
+        self.assertIn("Observed feature", pdf_text)
         self.assertIn("location", pdf_text)
-        self.assertIn("Near the", pdf_text)
+        self.assertIn("Near", pdf_text)
         self.assertIn("baseboard", pdf_text)
         self.assertIn("No linked usable photo observation", pdf_text)
+        self.assertNotIn("Photo comparison", pdf_text)
+        self.assertNotIn("AI suggestion", pdf_text)
+
+    def test_final_report_formats_passages_and_omits_private_evidence_and_invoice_details(self):
+        self._add_deduction("REPORTDEDUCT01", "Painting wall due to wear and tear")
+        with app.db() as con:
+            con.execute(
+                """INSERT INTO documents(
+                    id,case_id,filename,category,stored_path,extracted_text,
+                    page_text_json,status,invoice_json,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    "AGREEMENT01", self.case_id, "rental-agreement.pdf",
+                    "Rental agreement", "agreement.pdf", "Agreement clause text.",
+                    "{}", "extracted", None, "2025-01-01",
+                ),
+            )
+            con.execute(
+                """INSERT INTO documents(
+                    id,case_id,filename,category,stored_path,extracted_text,
+                    page_text_json,status,invoice_json,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    "INVOICE001", self.case_id, "private-invoice.pdf", "Invoice",
+                    "invoice.pdf", "INVOICE_PRIVATE_TEXT", "{}", "extracted",
+                    json.dumps({"invoice_number": "INVOICE_PRIVATE_NUMBER", "total": 6000}),
+                    "2025-01-01",
+                ),
+            )
+            con.execute(
+                "UPDATE deductions SET invoice_document_id=? WHERE id=?",
+                ("INVOICE001", "REPORTDEDUCT01"),
+            )
+            con.execute(
+                """INSERT INTO photo_pairs(
+                    id,case_id,item_name,observation_json,status,created_at
+                ) VALUES(?,?,?,?,?,?)""",
+                (
+                    "REPORTPHOTO01", self.case_id, "Living room wall",
+                    json.dumps({
+                        "mode": "llm_analyzed",
+                        "observation": "A visible change appears in the photographed wall.",
+                        "move_in_condition": "Wall appears intact.",
+                        "move_out_condition": "A mark is visible.",
+                        "observed_changes": [],
+                        "visible_differences": ["A mark is visible."],
+                        "comparable": "yes",
+                        "same_area_visible_in_both": True,
+                        "model_uncertainty": "low",
+                        "limitations": "Photographs do not establish cause.",
+                    }),
+                    "llm_analyzed", "2025-01-01",
+                ),
+            )
+            con.execute(
+                "UPDATE deductions SET photo_pair_id=? WHERE id=?",
+                ("REPORTPHOTO01", "REPORTDEDUCT01"),
+            )
+
+        clauses = [
+            {
+                "filename": "rental-agreement.pdf",
+                "page": "3",
+                "quote": (
+                    "Tenant is responsible for damage beyond ordinary wear. "
+                    + "Verified clause detail. " * 300
+                    + "CLAUSE_END_MARKER"
+                ),
+                "quote_verified": True,
+            },
+            {
+                "filename": "rental-agreement.pdf",
+                "page": "5",
+                "quote": "The landlord must provide an itemized statement.",
+                "quote_verified": False,
+            },
+        ]
+        assessment = {
+            "classification": "Insufficiently Documented",
+            "rules_classification": "Insufficiently Documented",
+            "llm_classification_suggestion": "Supported",
+            "explanation": (
+                "The claim is not sufficiently documented.\n\n"
+                + "The rules-engine classification remains authoritative. "
+                + "Explanation detail. " * 300
+                + "EXPLANATION_END_MARKER"
+            ),
+            "evidence_reviewed": "PRIVATE_REVIEWED_VALUE",
+            "missing_or_conflicting_evidence": "PRIVATE_MISSING_VALUE",
+            "limitations": "Limited to the documents provided.",
+        }
+        with patch.object(app, "llm_is_configured", return_value=True), \
+                patch.object(app, "find_relevant_clauses", return_value=clauses), \
+                patch.object(app, "verify_quote", side_effect=[True, False]), \
+                patch.object(app, "assess_deduction_with_llm", return_value=assessment):
+            markdown, pdf_path, _ = app.run_audit(self.case_id)
+
+        self.assertIn("01 — Painting wall due to wear and tear", markdown)
+        self.assertIn("Claimed amount:", markdown)
+        self.assertIn("Final classification", markdown)
+        self.assertIn("Rules-engine classification:", markdown)
+        self.assertIn("### Explanation", markdown)
+        self.assertIn("### Relevant agreement passages", markdown)
+        self.assertIn("Source document:</strong> rental-agreement.pdf", markdown)
+        self.assertIn("CLAUSE_END_MARKER", markdown)
+        self.assertIn("EXPLANATION_END_MARKER", markdown)
+        self.assertIn("Page:</strong> 3", markdown)
+        self.assertIn("Quotation verification:</strong> Verified", markdown)
+        self.assertIn("Quotation verification:</strong> Not verified", markdown)
+        self.assertEqual(markdown.count('class="dp-agreement-passage"'), 2)
+        self.assertNotIn("AI suggestion", markdown)
+        self.assertNotIn("Photo comparison", markdown)
+        self.assertNotIn("Evidence reviewed", markdown)
+        self.assertNotIn("Missing or conflicting evidence", markdown)
+        self.assertNotIn("PRIVATE_REVIEWED_VALUE", markdown)
+        self.assertNotIn("PRIVATE_MISSING_VALUE", markdown)
+        self.assertNotIn("Invoice source", markdown)
+        self.assertNotIn("Invoice comparison", markdown)
+        self.assertNotIn("private-invoice.pdf", markdown)
+        self.assertNotIn("INVOICE_PRIVATE_NUMBER", markdown)
+        self.assertNotIn("INVOICE_PRIVATE_TEXT", markdown)
+        self.assertIn("A visible change appears in the photographed wall.", markdown)
+
+        pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(pdf_path).pages)
+        self.assertGreater(len(PdfReader(pdf_path).pages), 1)
+        self.assertIn("01 — Painting wall due to wear and tear", pdf_text)
+        self.assertIn("Claimed amount", pdf_text)
+        self.assertIn("Final classification", pdf_text)
+        self.assertIn("Assessment method", pdf_text)
+        self.assertIn("Rules-engine classification", pdf_text)
+        self.assertIn("The rules-engine classification remains authoritative.", pdf_text)
+        self.assertIn("CLAUSE_END_MARKER", pdf_text)
+        self.assertIn("EXPLANATION_END_MARKER", pdf_text)
+        self.assertIn("rental-agreement.pdf", pdf_text)
+        self.assertIn("The landlord must provide an itemized statement.", pdf_text)
+        self.assertIn("Quotation verification: Verified", pdf_text)
+        self.assertIn("Quotation verification: Not verified", pdf_text)
+        self.assertNotIn("AI suggestion", pdf_text)
+        self.assertNotIn("Photo comparison", pdf_text)
+        self.assertNotIn("Evidence reviewed", pdf_text)
+        self.assertNotIn("Missing or conflicting evidence", pdf_text)
+        self.assertNotIn("PRIVATE_REVIEWED_VALUE", pdf_text)
+        self.assertNotIn("PRIVATE_MISSING_VALUE", pdf_text)
+        self.assertNotIn("Invoice source", pdf_text)
+        self.assertNotIn("Invoice comparison", pdf_text)
+        self.assertNotIn("private-invoice.pdf", pdf_text)
+        self.assertNotIn("INVOICE_PRIVATE_NUMBER", pdf_text)
+        self.assertNotIn("INVOICE_PRIVATE_TEXT", pdf_text)
+        self.assertIn("A visible change appears in the photographed wall.", pdf_text)
 
     def test_unlinked_photo_conclusion_is_included_without_associating_it_to_claim(self):
         observation = {

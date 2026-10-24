@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from pathlib import Path
 from xml.sax.saxutils import escape
@@ -117,7 +118,37 @@ def generate_audit_pdf(case, findings, totals, reports_dir: Path, photo_pairs=No
     )
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name="TitleCenter", parent=styles["Title"], alignment=TA_CENTER, textColor=colors.HexColor("#17365D")))
-    styles.add(ParagraphStyle(name="SmallText", parent=styles["BodyText"], fontSize=8, leading=10))
+    styles.add(ParagraphStyle(
+        name="ReportBody", parent=styles["BodyText"], fontName="Helvetica",
+        fontSize=10, leading=15, textColor=colors.HexColor("#263445"),
+        wordWrap="CJK", spaceAfter=5,
+    ))
+    styles.add(ParagraphStyle(
+        name="SmallText", parent=styles["ReportBody"], fontSize=9, leading=13,
+    ))
+    styles.add(ParagraphStyle(
+        name="DeductionTitle", parent=styles["Heading2"], fontSize=18,
+        leading=22, textColor=colors.HexColor("#17365D"), wordWrap="CJK",
+        spaceBefore=12, spaceAfter=4, keepWithNext=True,
+    ))
+    styles.add(ParagraphStyle(
+        name="SectionHeading", parent=styles["Heading3"], fontSize=12,
+        leading=16, textColor=colors.HexColor("#17365D"), spaceBefore=9,
+        spaceAfter=5, keepWithNext=True,
+    ))
+    styles.add(ParagraphStyle(
+        name="StatusText", parent=styles["ReportBody"], fontSize=11,
+        leading=15, textColor=colors.HexColor("#713F12"),
+        backColor=colors.HexColor("#FEF3C7"),
+        borderColor=colors.HexColor("#F2C66D"), borderWidth=0.8,
+        borderPadding=8, spaceBefore=4, spaceAfter=9,
+    ))
+    styles.add(ParagraphStyle(
+        name="PassageText", parent=styles["SmallText"],
+        backColor=colors.HexColor("#F8FAFC"),
+        borderColor=colors.HexColor("#DCE4EE"), borderWidth=0.6,
+        borderPadding=8, spaceBefore=4, spaceAfter=6,
+    ))
     story = [
         Paragraph("DepositProof AI", styles["TitleCenter"]),
         Paragraph("Rental Security Deposit Evidence Audit", styles["Heading2"]),
@@ -149,46 +180,73 @@ def generate_audit_pdf(case, findings, totals, reports_dir: Path, photo_pairs=No
         Spacer(1, 14),
     ]
     for i, f in enumerate(findings, 1):
-        story.append(Paragraph(f"{i}. {_text(f.get('description', 'Deduction'))}", styles["Heading2"]))
-        story.append(Paragraph(f"<b>Amount:</b> INR {float(f.get('amount') or 0):,.2f}", styles["BodyText"]))
-        story.append(Paragraph(f"<b>Final classification:</b> {_text(f.get('classification', 'Insufficiently Documented'))}", styles["BodyText"]))
-        story.append(Paragraph(f"<b>Assessment method:</b> {_text(f.get('assessment_method', 'Rules-based assessment; hosted LLM use not recorded.'))}", styles["SmallText"]))
-        story.append(Paragraph(f"<b>Rules-engine classification:</b> {_text(f.get('rules_classification', f.get('classification', 'Insufficiently Documented')))}", styles["SmallText"]))
-        if f.get("llm_classification_suggestion"):
-            story.append(Paragraph(
-                f"<b>LLM suggestion (not authoritative):</b> {_text(f['llm_classification_suggestion'])}",
-                styles["SmallText"]
-            ))
-        for label, key in [
-            ("Explanation", "explanation"),
-            ("Evidence reviewed", "evidence_reviewed"),
-            ("Missing or conflicting evidence", "missing_or_conflicting_evidence"),
-            ("Limitations", "limitations"),
-        ]:
-            value = _text(f.get(key) or "Not provided.")
-            story.append(Paragraph(f"<b>{label}:</b> {value[:3000]}", styles["SmallText"]))
-            story.append(Spacer(1, 3))
-        if f.get("ai_error"):
-            story.append(Paragraph(
-                f"<b>Hosted AI unavailable:</b> {_text(f['ai_error'])[:1000]} (rules-based fallback used.)",
-                styles["SmallText"]
-            ))
+        classification = f.get("classification", "Insufficiently Documented")
+        story.append(Paragraph(
+            f"{i:02d} — {_text(f.get('description', 'Deduction'))}",
+            styles["DeductionTitle"],
+        ))
+        story.append(Paragraph(
+            f"<b>Claimed amount:</b> INR {float(f.get('amount') or 0):,.2f}",
+            styles["ReportBody"],
+        ))
+        story.append(Paragraph("Final classification", styles["SectionHeading"]))
+        story.append(Paragraph(
+            f"<b>Final classification:</b> {_text(classification)}",
+            styles["StatusText"],
+        ))
+        assessment_details = [[
+            Paragraph(
+                "<b>Assessment method</b><br/>" + _text(f.get(
+                    "assessment_method",
+                    "Rules-based assessment; hosted LLM use not recorded.",
+                )),
+                styles["SmallText"],
+            ),
+            Paragraph(
+                "<b>Rules-engine classification</b><br/>" + _text(f.get(
+                    "rules_classification", classification,
+                )),
+                styles["SmallText"],
+            ),
+        ]]
+        assessment_table = Table(assessment_details, colWidths=[3.65*inch, 3.65*inch])
+        assessment_table.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#F8FAFC")),
+            ("BOX", (0,0), (-1,-1), 0.5, colors.HexColor("#DCE4EE")),
+            ("INNERGRID", (0,0), (-1,-1), 0.35, colors.HexColor("#DCE4EE")),
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("PADDING", (0,0), (-1,-1), 8),
+        ]))
+        story.append(Paragraph("Assessment details", styles["SectionHeading"]))
+        story.append(assessment_table)
+        story.append(Paragraph("Explanation", styles["SectionHeading"]))
+        explanation = str(f.get("explanation") or "No explanation available.")
+        for paragraph in re.split(r"\n\s*\n", explanation.strip()):
+            if paragraph.strip():
+                story.append(Paragraph(
+                    _text(paragraph).replace("\n", "<br/>"),
+                    styles["ReportBody"],
+                ))
         clauses = f.get("clauses") or []
         if clauses:
-            story.append(Paragraph("<b>Retrieved agreement passages</b>", styles["BodyText"]))
+            story.append(Paragraph("Relevant agreement passages", styles["SectionHeading"]))
             for c in clauses[:5]:
-                quote = _text(c.get("quote", ""))[:1000]
+                verified = "Verified" if c.get("quote_verified") else "Not verified"
+                quote = _text(c.get("quote", "")).replace("\n", "<br/>")
                 story.append(Paragraph(
-                    f"{_text(c.get('filename', 'Agreement'))} — page {_text(c.get('page', 'unknown'))} — "
-                    f"quotation verified: {c.get('quote_verified', False)}<br/>{quote}",
-                    styles["SmallText"]
+                    f"<b>Source document:</b> {_text(c.get('filename', 'Agreement'))}<br/>"
+                    f"<b>Page number:</b> {_text(c.get('page', 'unknown'))}<br/>"
+                    f"<b>Clause text:</b><br/>{quote}<br/>"
+                    f"<b>Quotation verification:</b> {verified}",
+                    styles["PassageText"],
                 ))
-        invoice = f.get("invoice") or {}
-        if invoice:
-            story.append(Paragraph(f"<b>Invoice:</b> {_text(invoice.get('filename', 'Selected document'))}", styles["SmallText"]))
+        story.append(Paragraph("Limitations", styles["SectionHeading"]))
+        story.append(Paragraph(
+            _text(f.get("limitations") or "Not provided."),
+            styles["ReportBody"],
+        ))
         photo = f.get("photo_observation") or {}
         if photo:
-            story.append(Paragraph("<b>Photo comparison — separate vision-language observation</b>", styles["BodyText"]))
             if photo.get("mode") != "llm_analyzed":
                 story.append(Paragraph(
                     "A photo pair is linked, but no successful vision-model observation is stored.",
@@ -279,10 +337,15 @@ def generate_audit_pdf(case, findings, totals, reports_dir: Path, photo_pairs=No
             ))
         else:
             story.append(Paragraph(
-                "<b>Photo comparison:</b> No linked usable photo observation is available for this deduction.",
+                "No linked usable photo observation is available for this deduction.",
                 styles["SmallText"]
             ))
         _append_repair_benchmark(story, f.get("repair_price_benchmark"), styles)
+        if f.get("ai_error"):
+            story.append(Paragraph(
+                f"<b>Hosted AI unavailable:</b> {_text(f['ai_error'])[:1000]} (rules-based fallback used.)",
+                styles["SmallText"]
+            ))
         story.append(Spacer(1, 10))
     if photo_pairs:
         story.append(Paragraph("Saved photo comparisons not linked to a deduction", styles["Heading2"]))

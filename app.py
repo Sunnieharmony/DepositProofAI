@@ -27,7 +27,6 @@ load_dotenv(dotenv_path=ROOT / ".env")
 from document_processing import extract_inspection_fields, extract_pdf
 from evidence_engine import (
     classify_deduction,
-    embedding_status,
     extract_invoice_fields,
     find_relevant_clauses,
     money_text,
@@ -41,9 +40,7 @@ from llm_integration import (
     get_last_error,
     explain_repair_benchmark_with_llm,
     llm_is_configured,
-    text_model,
     validate_image_file,
-    vision_model,
 )
 from report_generator import generate_audit_pdf
 from repair_price_intelligence import (
@@ -169,14 +166,14 @@ def _photo_comparison_markdown(
     photo: dict, item_name: str | None, description: str | None
 ) -> list[str]:
     if photo.get("mode") != "llm_analyzed":
-        lines = ["**Photo comparison:** The pair was saved, but no successful vision-model observation is stored."]
+        lines = ["The pair was saved, but no successful vision-model observation is stored."]
         if photo.get("error"):
             lines.append(f"- **Analysis error:** {photo['error']}")
         if not description:
             lines.append("- This photo pair is not associated with a deduction.")
         return lines
 
-    lines = ["**Photo comparison (separate vision-language observation):**"]
+    lines = []
     summary = photo.get("observation")
     if summary:
         lines.append(f"- **Summary:** {summary}")
@@ -316,7 +313,7 @@ def create_case(name, deposit, claimed, proposed, move_in, move_out):
         )
     calculated = deposit - claimed
     msg = (
-        f"### Case created: `{case_id}`\n\n"
+        f"<h3>Case created: <span class=\"dp-case-id\">{case_id}</span></h3>\n\n"
         f"- **Security deposit:** {money(deposit)}\n"
         f"- **Claimed deductions:** {money(claimed)}\n"
         f"- **Calculated refund:** {money(calculated)}\n"
@@ -328,15 +325,10 @@ def create_case(name, deposit, claimed, proposed, move_in, move_out):
 
 
 def ai_status_markdown() -> str:
-    """Plain statement of which AI components are active, so nothing is overstated."""
-    emb = embedding_status()
+    """Show whether AI-assisted analysis is available without exposing configuration."""
     if llm_is_configured():
-        hosted = f"Hosted models enabled — vision: `{vision_model()}`, language: `{text_model()}`."
-    else:
-        hosted = "Hosted models **not configured** (no API key for the selected provider): photos are saved but not analysed, and assessments use the rules-based fallback only."
-    retrieval = ("Clause retrieval uses semantic search (`sentence-transformers`) when installed; otherwise a labelled keyword fallback."
-                 if not emb["error"] else f"Clause retrieval is using the keyword fallback ({emb['error']}).")
-    return f"**AI status:** {hosted} {retrieval}"
+        return "**AI status:** AI-assisted analysis is available."
+    return "**AI status:** AI-assisted analysis is unavailable; rules-based assessment remains available."
 
 
 def list_cases():
@@ -909,32 +901,57 @@ def run_audit(case_id):
     ]
     for i, f in enumerate(report_findings, 1):
         lines += [
-            "", f"## {i}. {f['description']} — {money(f['amount'], case['currency'])}",
-            f"**Final classification:** {f.get('classification', 'Insufficiently Documented')}",
-            f"**Assessment method:** {f.get('assessment_method', _assessment_method(f))}",
-            f"**Rules-engine classification:** {f.get('rules_classification', f.get('classification', 'Insufficiently Documented'))}",
-            f"**Explanation:** {f.get('explanation', 'No explanation available.')}",
-            f"**Evidence reviewed:** {f.get('evidence_reviewed', 'See evidence details below.')}",
-            f"**Missing or conflicting evidence:** {f.get('missing_or_conflicting_evidence', 'Not specified.')}",
-            f"**Limitations:** {f.get('limitations', 'This assessment is limited to the uploaded evidence.')}",
+            "", f"## {i:02d} — {f['description']}",
+            f"**Claimed amount:** {money(f['amount'], case['currency'])}",
+            "",
+            "### Final classification",
+            '<div class="dp-report-classification"><span>Final classification</span>'
+            f"<strong>{html.escape(str(f.get('classification', 'Insufficiently Documented')))}</strong></div>",
+            "",
+            "### Assessment details",
+            f"- **Assessment method:** {f.get('assessment_method', _assessment_method(f))}",
+            f"- **Rules-engine classification:** {f.get('rules_classification', f.get('classification', 'Insufficiently Documented'))}",
+            "",
+            "### Explanation",
         ]
+        explanation = str(f.get("explanation") or "No explanation available.")
+        explanation_paragraphs = re.split(r"\n\s*\n", explanation.strip())
+        lines.extend(
+            f"<p>{html.escape(paragraph).replace(chr(10), '<br>')}</p>"
+            for paragraph in explanation_paragraphs if paragraph.strip()
+        )
         if f.get("clauses"):
-            lines.append("**Relevant agreement passages:**")
+            lines.extend(["", "### Relevant agreement passages"])
             for c in f["clauses"][:5]:
-                lines.append(f"- {c.get('filename', 'Agreement')}, page {c.get('page', 'unknown')}: “{c.get('quote', '')}” (quotation verified: {c.get('quote_verified', False)})")
-        if f.get("invoice"):
-            lines.append(f"**Invoice source:** {f['invoice'].get('filename', 'Selected document')}")
-            lines.append(f"**Invoice extraction:** {json.dumps({k:v for k,v in f['invoice'].items() if k != 'extracted_text'}, ensure_ascii=False)}")
+                verified = "Verified" if c.get("quote_verified") else "Not verified"
+                lines.extend([
+                    "",
+                    '<div class="dp-agreement-passage">',
+                    f'<p><strong>Source document:</strong> {html.escape(str(c.get("filename", "Agreement")))}'
+                    f' &nbsp; <strong>Page:</strong> {html.escape(str(c.get("page", "unknown")))}</p>',
+                    f'<p><strong>Clause text</strong><br>{html.escape(str(c.get("quote", ""))).replace(chr(10), "<br>")}</p>',
+                    f'<p><strong>Quotation verification:</strong> {verified}</p>',
+                    "</div>",
+                ])
+        lines.extend([
+            "",
+            "### Limitations",
+            f.get("limitations", "This assessment is limited to the uploaded evidence."),
+        ])
         if f.get("photo_observation"):
             photo = f["photo_observation"]
+            lines.append("")
             lines.extend(_photo_comparison_markdown(photo, f.get("photo_item_name"), f["description"]))
         else:
-            lines.append("**Photo comparison:** No linked usable photo observation is available for this deduction.")
+            lines.extend([
+                "",
+                "No linked usable photo observation is available for this deduction.",
+            ])
         benchmark = f.get("repair_price_benchmark")
         if benchmark:
             lines.extend([
                 "",
-                "**Repair-price benchmark (context only; does not change the classification):**",
+                "### Repair-price benchmark — context only",
                 f"- Comparison: {benchmark.get('match_description', 'Comparable sample-rate records')} "
                 f"for {benchmark.get('category', 'the selected category')} in "
                 f"{benchmark.get('city', 'the selected city')}"
@@ -954,11 +971,7 @@ def run_audit(case_id):
                     f"- Optional hosted-model explanation (does not change the calculation): {benchmark['llm_explanation']}"
                 )
         if f.get("ai_error"):
-            lines.append(f"**Hosted AI unavailable:** {f['ai_error']} (rules-based fallback used.)")
-        if f.get("llm_classification_suggestion"):
-            lines.append(
-                f"**LLM suggestion (not authoritative):** {f['llm_classification_suggestion']}"
-            )
+            lines.extend(["", f"**Hosted AI unavailable:** {f['ai_error']} (rules-based fallback used.)"])
     linked_photo_ids = {f.get("photo_pair_id") for f in report_findings if f.get("photo_pair_id")}
     unlinked_photo_pairs = [p for p in photos if p["id"] not in linked_photo_ids]
     if unlinked_photo_pairs:
@@ -1067,33 +1080,42 @@ def load_selected_case(choice):
         f"Loaded case `{case_id}`." if case_id else "Select a saved case first.",
     )
 
-_WORKFLOW_STEPS = ("Audit case", "Evidence", "Review findings", "Final report")
-
-
-def _render_workflow_stepper(active_step: int) -> str:
-    items = []
-    for index, label in enumerate(_WORKFLOW_STEPS, start=1):
-        state = "complete" if index < active_step else "active" if index == active_step else "upcoming"
-        items.append(
-            f'<div class="dp-step dp-step--{state}" aria-current="{"step" if state == "active" else "false"}">'
-            f'<span class="dp-step__number">{index}</span><span>{html.escape(label)}</span></div>'
-        )
-    return '<nav class="dp-stepper" aria-label="Audit progress">' + "".join(items) + "</nav>"
-
-
 def _workflow_visibility(active_step: int):
     if active_step not in range(1, 5):
         raise ValueError("Workflow step must be between 1 and 4.")
     return (
         *(gr.update(visible=index == active_step) for index in range(1, 5)),
-        _render_workflow_stepper(active_step),
+        *(
+            gr.update(
+                variant="secondary",
+                elem_classes=[
+                    "dp-step",
+                    "dp-step--active" if index == active_step
+                    else "dp-step--upcoming",
+                ],
+            )
+            for index in range(1, 5)
+        ),
     )
 
 
-def _navigate_to_step(label: str):
-    if label not in _WORKFLOW_STEPS:
-        raise ValueError(f"Unknown workflow step: {label}")
-    return (*_workflow_visibility(_WORKFLOW_STEPS.index(label) + 1)[:5], "")
+def _navigate_to_step(target_step: int, case_id: str | None, report_markdown: str | None):
+    if target_step not in range(1, 5):
+        raise ValueError("Workflow step must be between 1 and 4.")
+    message = ""
+    if target_step in (2, 3):
+        problem = _active_case_problem(case_id)
+        if problem:
+            message = (
+                f"**{problem} You can still explore this section without an active case.**"
+            )
+    elif target_step == 4 and (
+        not report_markdown
+        or not report_markdown.strip()
+        or report_markdown.strip() == "Your report will appear here after the audit completes."
+    ):
+        message = "**Run the evidence audit from Review findings to generate a report.**"
+    return (*_workflow_visibility(target_step), message)
 
 
 def _enter_application():
@@ -1115,26 +1137,15 @@ def _active_case_problem(case_id):
 
 
 def _continue_from_case(case_id):
-    problem = _active_case_problem(case_id)
-    if problem:
-        return (*_workflow_visibility(1)[:5], f"**{problem}**")
-    return (*_workflow_visibility(2)[:5], "")
+    return _navigate_to_step(2, case_id, None)
 
 
 def _continue_from_evidence(case_id):
-    problem = _active_case_problem(case_id)
-    if problem:
-        return (*_workflow_visibility(2)[:5], f"**{problem}**")
-    return (*_workflow_visibility(3)[:5], "")
+    return _navigate_to_step(3, case_id, None)
 
 
 def _continue_from_review(report_markdown):
-    if not report_markdown or not str(report_markdown).strip():
-        return (
-            *_workflow_visibility(3)[:5],
-            "**Run the evidence audit before continuing to the final report.**",
-        )
-    return (*_workflow_visibility(4)[:5], "")
+    return _navigate_to_step(4, None, report_markdown)
 
 
 def _run_audit_for_workflow(case_id):
@@ -1195,27 +1206,22 @@ html, body, .gradio-container {
 .dp-enter { width: max-content !important; min-width: 220px !important; }
 .dp-app-shell { padding-bottom: 48px; }
 .dp-topbar { position: sticky; z-index: 20; top: 0; display: flex; align-items: center; justify-content: space-between; gap: 22px; margin-bottom: 24px; padding: 12px 0; border-bottom: 1px solid var(--dp-line); background: rgba(245,247,250,.96); backdrop-filter: blur(12px); }
+.dp-topbar > .block,
+.dp-topbar > .row { width: auto !important; min-width: 0; flex: none !important; }
 .dp-topbar .dp-brand-lockup svg { width: 34px; height: 38px; }
-.dp-nav { display: flex; justify-content: flex-end; gap: 5px; flex-wrap: wrap; }
-.dp-nav button { min-height: 38px !important; padding: 0 12px !important; border: 1px solid transparent !important; border-radius: 7px !important; background: transparent !important; color: var(--dp-muted) !important; font-size: 12px !important; font-weight: 600 !important; box-shadow: none !important; transition: color .16s ease, background .16s ease, border-color .16s ease !important; }
-.dp-nav button:hover { border-color: var(--dp-line) !important; background: #fff !important; color: var(--dp-navy) !important; }
-.dp-mobile-nav { display: none !important; }
+.dp-header-quote { margin-left: auto; color: var(--dp-blue-dark); font-family: Georgia, "Times New Roman", serif; font-size: 14px; font-style: italic; line-height: 1.4; text-align: right; white-space: nowrap; }
 .dp-page-heading { margin: 0 0 18px; }
 .dp-page-heading h1 { margin: 6px 0 8px; color: var(--dp-navy); font-size: clamp(27px, 4vw, 38px); font-weight: 620; letter-spacing: -.04em; }
 .dp-page-heading p { max-width: 780px; margin: 0; color: var(--dp-muted); font-size: 14px; line-height: 1.65; }
-.dp-stepper { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 18px 0 24px; border-bottom: 1px solid var(--dp-line); }
-.dp-step { position: relative; display: flex; align-items: center; gap: 10px; min-height: 52px; padding: 8px 12px 14px 0; color: #82909c; font-size: 12px; font-weight: 600; }
-.dp-step:after { position: absolute; right: 10px; bottom: -1px; left: 0; height: 2px; background: transparent; content: ""; }
-.dp-step--active { color: var(--dp-navy); }
-.dp-step--active:after { background: var(--dp-blue); }
-.dp-step--complete { color: var(--dp-success); }
-.dp-step__number { display: grid; width: 25px; height: 25px; flex: none; place-items: center; border: 1px solid var(--dp-line-strong); border-radius: 50%; color: inherit; font-size: 11px; }
-.dp-step > span:last-child { color: inherit !important; }
-.dp-step--active .dp-step__number { border-color: var(--dp-blue); background: var(--dp-blue); color: #fff; }
-.dp-step--active .dp-step__number { color: #fff !important; }
-.dp-step--complete .dp-step__number { border-color: #c9ddd2; background: #edf5f0; }
-.dp-workflow-message:empty { display: none !important; }
-.dp-workflow-message { margin: 12px 0; padding: 10px 13px; border-left: 2px solid var(--dp-danger); background: #fbf4f2; color: #754541; font-size: 12px; line-height: 1.55; }
+.dp-stepper { display: flex; align-items: stretch; gap: 22px; margin: 18px 0 24px; border-bottom: 1px solid var(--dp-line); }
+.dp-step { position: relative; display: flex; flex: 1 1 0; width: auto !important; min-width: 0 !important; min-height: 52px !important; align-items: center; justify-content: flex-start; padding: 8px 0 14px !important; border: 0 !important; border-radius: 0 !important; background: transparent !important; color: #34485c !important; font-size: 13px !important; font-weight: 550 !important; text-align: left; box-shadow: none !important; transition: color .16s ease !important; }
+.dp-step:hover { background: transparent !important; color: var(--dp-navy) !important; }
+.dp-step:focus-visible { outline: 2px solid #72869a !important; outline-offset: 2px; }
+.dp-step:after { position: absolute; right: 0; bottom: -1px; left: 0; height: 2px; background: transparent; content: ""; }
+.dp-step--active:after { background: var(--dp-navy); }
+.dp-step--active { color: var(--dp-navy) !important; font-weight: 700 !important; }
+.dp-workflow-message:has(.md:empty) { display: none !important; }
+.dp-workflow-message { margin: 12px 0; padding: 10px 13px; border-left: 2px solid #8ba3b8; background: #f5f8fa; color: #34485c; font-size: 12px; line-height: 1.55; }
 .dp-workflow-panel { min-width: 0; padding: clamp(20px, 3vw, 32px); border: 1px solid var(--dp-line); border-radius: var(--dp-radius); background: var(--dp-paper); box-shadow: var(--dp-shadow); }
 .dp-section-title { margin: 0 0 7px; color: var(--dp-navy); font-size: 20px; font-weight: 620; letter-spacing: -.02em; }
 .dp-section-copy { margin: 0 0 21px; color: var(--dp-muted); font-size: 13px; line-height: 1.65; }
@@ -1277,10 +1283,6 @@ html, body, .gradio-container {
 .dp-photo-card .dp-photo-instructions .dp-upload-icon { color: var(--dp-blue) !important; }
 .dp-photo-card [data-testid="upload-text"] .or,
 .dp-document-upload [data-testid="upload-text"] .or { color: var(--dp-muted) !important; }
-.dp-photo-card [data-testid="file-upload"],
-.dp-document-upload [data-testid="file-upload"] { color: var(--dp-ink) !important; }
-.dp-photo-card [data-testid="file-upload"] *,
-.dp-document-upload [data-testid="file-upload"] * { color: inherit; }
 .dp-photo-card img { max-height: 190px; object-fit: contain; }
 .dp-photo-preview img { max-height: 180px; object-fit: contain !important; }
 .dp-photo-preview [data-testid="image"] { background: #f8fafc !important; }
@@ -1297,8 +1299,34 @@ html, body, .gradio-container {
 .dp-action-row button { flex: 0 0 auto !important; width: auto !important; min-width: 150px; }
 .dp-upload-help { margin: 3px 0 15px; color: var(--dp-muted); font-size: 12px; line-height: 1.65; }
 .dp-result-block { min-width: 0; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--dp-line); overflow-wrap: anywhere; color: var(--dp-ink); opacity: 1; }
-.dp-report .prose { max-width: 100%; color: var(--dp-ink); opacity: 1; line-height: 1.75; }
-.dp-report .prose h1, .dp-report .prose h2, .dp-report .prose h3 { color: var(--dp-navy); letter-spacing: -.025em; }
+.dp-case-summary .prose .dp-case-id { display: inline-block; max-width: 100%; padding: 8px 11px; border: 1px solid var(--dp-line-strong); border-radius: 6px; background: #f8fafc; color: var(--dp-navy); font: 600 15px/1.4 "Segoe UI", Arial, sans-serif; overflow-wrap: anywhere; user-select: text; }
+.dp-document-upload .file-preview .file,
+.dp-photo-upload .file-preview .file { background: #fff !important; color: var(--dp-ink) !important; }
+.dp-document-upload .file-preview .filename,
+.dp-document-upload .file-preview .filename .stem,
+.dp-document-upload .file-preview .filename .ext,
+.dp-photo-upload .file-preview .filename,
+.dp-photo-upload .file-preview .filename .stem,
+.dp-photo-upload .file-preview .filename .ext { color: var(--dp-ink) !important; -webkit-text-fill-color: var(--dp-ink) !important; opacity: 1 !important; overflow-wrap: anywhere; }
+.dp-document-upload .file-preview .download,
+.dp-photo-upload .file-preview .download,
+.dp-document-upload .file-preview .download-link,
+.dp-photo-upload .file-preview .download-link { color: var(--dp-muted) !important; -webkit-text-fill-color: var(--dp-muted) !important; opacity: 1 !important; }
+.dp-document-upload .file-preview .file:hover,
+.dp-photo-upload .file-preview .file:hover { background: #f8fafc !important; }
+.dp-document-upload .file-preview .icon-button,
+.dp-photo-upload .file-preview .icon-button { color: var(--dp-ink) !important; }
+.dp-report .prose { max-width: 100%; color: var(--dp-ink); opacity: 1; font-size: 15px; line-height: 1.65; overflow-wrap: anywhere; }
+.dp-report .prose h1, .dp-report .prose h2, .dp-report .prose h3 { color: var(--dp-navy); letter-spacing: -.02em; overflow-wrap: anywhere; }
+.dp-report .prose h2 { margin: 30px 0 8px; font-size: 26px; line-height: 1.3; }
+.dp-report .prose h3 { margin: 22px 0 9px; font-size: 18px; line-height: 1.4; }
+.dp-report .prose p { margin: 8px 0; }
+.dp-report .prose .dp-report-classification { display: flex; flex-wrap: wrap; align-items: baseline; gap: 7px 12px; box-sizing: border-box; margin: 10px 0 16px; padding: 12px 15px; border: 1px solid #f2c66d; border-radius: 7px; background: #fff7e6; color: #593b08; overflow-wrap: anywhere; }
+.dp-report .prose .dp-report-classification { font-size: 15px; }
+.dp-report .prose .dp-report-classification strong { font-size: 17px; }
+.dp-report .prose .dp-report-classification span { font-weight: 650; }
+.dp-report .prose .dp-agreement-passage { box-sizing: border-box; margin: 9px 0; padding: 10px 13px; border: 1px solid #dce4ee; border-left: 3px solid #9aabc0; border-radius: 5px; background: #f8fafc; overflow-wrap: anywhere; }
+.dp-report .prose .dp-agreement-passage p { margin: 3px 0; }
 .dp-report .prose table { width: 100%; border-collapse: collapse; }
 .dp-report .prose th, .dp-report .prose td { padding: 10px 12px; border-bottom: 1px solid var(--dp-line); text-align: left; vertical-align: top; }
 .dp-report .prose th { background: var(--dp-paper-muted); color: var(--dp-navy); font-size: 12px; }
@@ -1309,19 +1337,17 @@ html, body, .gradio-container {
   .dp-welcome { padding: 20px 0; }
   .dp-welcome__frame { padding: 30px 24px 38px; }
   .dp-topbar { align-items: flex-start; flex-direction: column; gap: 10px; padding: 12px 0; }
-  .dp-nav { justify-content: flex-start; width: 100%; }
-  .dp-nav button { padding: 0 9px !important; font-size: 11px !important; }
-  .dp-step { align-items: flex-start; flex-direction: row; gap: 7px; min-width: 0; padding-right: 5px; font-size: 10px; }
+  .dp-header-quote { max-width: 100%; margin-left: 0; white-space: normal; text-align: left; }
+  .dp-stepper { gap: 14px; }
+  .dp-step { min-height: 48px !important; font-size: 11px !important; }
   .dp-workflow-panel { min-height: 0; padding: 20px 16px; }
   .dp-case-layout, .dp-photo-grid { flex-wrap: wrap !important; }
   .dp-case-card, .dp-photo-card { flex: 1 1 100% !important; }
   .dp-action-row { margin-top: 22px; }
 }
 @media (max-width: 480px) {
-  .dp-step { flex-direction: column; gap: 5px; font-size: 9px; }
-  .dp-step__number { width: 22px; height: 22px; }
-  .dp-nav { display: none !important; }
-  .dp-mobile-nav { display: block !important; width: 100% !important; }
+  .dp-stepper { gap: 8px; }
+  .dp-step { justify-content: center; font-size: 10px !important; text-align: center; }
   .dp-action-row { flex-wrap: wrap; }
   .dp-welcome, .dp-app-shell { width: calc(100% - 24px); }
   .dp-workflow-panel { padding: 18px 14px; }
@@ -1332,7 +1358,7 @@ html, body, .gradio-container {
 }
 @media print {
   body, .gradio-container { background: #fff !important; }
-  .dp-topbar, .dp-nav, .dp-mobile-nav, .dp-stepper, .dp-action-row, .dp-footer-note { display: none !important; }
+  .dp-topbar, .dp-stepper, .dp-action-row, .dp-footer-note { display: none !important; }
   .dp-app-shell, .dp-workflow-panel { width: 100% !important; max-width: none !important; padding: 0 !important; border: 0 !important; box-shadow: none !important; }
 }
 """
@@ -1379,17 +1405,10 @@ with gr.Blocks(
                 </div>
                 """
             )
-            with gr.Row(elem_classes=["dp-nav"]):
-                nav_case = gr.Button("1  Case", elem_classes=["dp-nav-button"])
-                nav_evidence = gr.Button("2  Evidence", elem_classes=["dp-nav-button"])
-                nav_findings = gr.Button("3  Findings", elem_classes=["dp-nav-button"])
-                nav_report = gr.Button("4  Report", elem_classes=["dp-nav-button"])
-            mobile_nav = gr.Dropdown(
-                label="Navigate to a section",
-                choices=list(_WORKFLOW_STEPS),
-                value=_WORKFLOW_STEPS[0],
-                interactive=True,
-                elem_classes=["dp-mobile-nav"],
+            gr.HTML(
+                '<div class="dp-header-quote">'
+                '"Your deposit, Your evidence, Your peace of mind"'
+                "</div>"
             )
 
         gr.HTML(
@@ -1397,7 +1416,11 @@ with gr.Blocks(
             '<h1>Build a clear evidence record</h1>'
             '<p>Move through each step at your own pace. Uploaded records and model observations are shown only after the application reports them.</p></header>'
         )
-        stepper = gr.HTML(_render_workflow_stepper(1))
+        with gr.Row(elem_classes=["dp-stepper"]):
+            step_case = gr.Button("Audit case", elem_classes=["dp-step", "dp-step--active"])
+            step_evidence = gr.Button("Evidence", elem_classes=["dp-step", "dp-step--upcoming"])
+            step_findings = gr.Button("Review findings", elem_classes=["dp-step", "dp-step--upcoming"])
+            step_report = gr.Button("Final report", elem_classes=["dp-step", "dp-step--upcoming"])
         workflow_message = gr.Markdown(elem_classes=["dp-workflow-message"])
 
         with gr.Column(visible=True, elem_classes=["dp-workflow-panel"]) as case_step:
@@ -1418,7 +1441,9 @@ with gr.Blocks(
                         move_out = gr.Textbox(label="Move-out date (optional)", placeholder="YYYY-MM-DD")
                     create_btn = gr.Button("Create audit case", variant="primary")
                     active_case = gr.Textbox(label="Active case ID", interactive=False)
-                    case_message = gr.Markdown(elem_classes=["dp-result-block"])
+                    case_message = gr.Markdown(
+                        elem_classes=["dp-result-block", "dp-case-summary"]
+                    )
                 with gr.Column(scale=2, elem_classes=["dp-case-card"]):
                     gr.HTML('<h3 class="dp-subsection">Continue a saved case</h3>')
                     case_dropdown = gr.Dropdown(label="Saved cases", choices=list_cases(), interactive=True)
@@ -1519,6 +1544,7 @@ with gr.Blocks(
                         photo_in = gr.File(
                             label="Choose move-in photo", type="filepath",
                             file_types=[".png", ".jpg", ".jpeg", ".webp"],
+                            elem_classes=["dp-photo-upload"],
                         )
                         photo_in_preview = gr.Image(
                             label="Selected move-in preview", interactive=False,
@@ -1534,6 +1560,7 @@ with gr.Blocks(
                         photo_out = gr.File(
                             label="Choose move-out photo", type="filepath",
                             file_types=[".png", ".jpg", ".jpeg", ".webp"],
+                            elem_classes=["dp-photo-upload"],
                         )
                         photo_out_preview = gr.Image(
                             label="Selected move-out preview", interactive=False,
@@ -1631,37 +1658,51 @@ with gr.Blocks(
             'Local files and database records require appropriate privacy and retention controls.</p>'
         )
 
+    workflow_components = [
+        case_step, evidence_step, review_step, report_step,
+        step_case, step_evidence, step_findings, step_report, workflow_message,
+    ]
+
     enter_app_btn.click(
         _enter_application,
-        outputs=[welcome_screen, app_shell, case_step, evidence_step, review_step, report_step, stepper, workflow_message],
+        outputs=[welcome_screen, app_shell, *workflow_components],
         show_progress="hidden",
     )
     case_continue.click(
         _continue_from_case, [active_case],
-        [case_step, evidence_step, review_step, report_step, stepper, workflow_message],
+        workflow_components,
     )
     evidence_continue.click(
         _continue_from_evidence,
         [active_case],
-        [case_step, evidence_step, review_step, report_step, stepper, workflow_message],
+        workflow_components,
     )
-    evidence_back.click(lambda: (*_workflow_visibility(1)[:5], ""), outputs=[case_step, evidence_step, review_step, report_step, stepper, workflow_message])
-    review_back.click(lambda: (*_workflow_visibility(2)[:5], ""), outputs=[case_step, evidence_step, review_step, report_step, stepper, workflow_message])
+    evidence_back.click(
+        lambda case_id: _navigate_to_step(1, case_id, None),
+        [active_case], workflow_components,
+    )
+    review_back.click(
+        lambda case_id: _navigate_to_step(2, case_id, None),
+        [active_case], workflow_components,
+    )
     review_continue.click(
         _continue_from_review,
-        [audit_output],
-        [case_step, evidence_step, review_step, report_step, stepper, workflow_message],
+        [report_output],
+        workflow_components,
     )
-    report_back.click(lambda: (*_workflow_visibility(3)[:5], ""), outputs=[case_step, evidence_step, review_step, report_step, stepper, workflow_message])
-    nav_case.click(lambda: (*_workflow_visibility(1)[:5], ""), outputs=[case_step, evidence_step, review_step, report_step, stepper, workflow_message])
-    nav_evidence.click(lambda: (*_workflow_visibility(2)[:5], ""), outputs=[case_step, evidence_step, review_step, report_step, stepper, workflow_message])
-    nav_findings.click(lambda: (*_workflow_visibility(3)[:5], ""), outputs=[case_step, evidence_step, review_step, report_step, stepper, workflow_message])
-    nav_report.click(lambda: (*_workflow_visibility(4)[:5], ""), outputs=[case_step, evidence_step, review_step, report_step, stepper, workflow_message])
-    mobile_nav.change(
-        _navigate_to_step,
-        [mobile_nav],
-        [case_step, evidence_step, review_step, report_step, stepper, workflow_message],
+    report_back.click(
+        lambda case_id: _navigate_to_step(3, case_id, None),
+        [active_case], workflow_components,
     )
+    for step_number, step_button in enumerate(
+        (step_case, step_evidence, step_findings, step_report), start=1,
+    ):
+        step_button.click(
+            lambda case_id, report, target=step_number: _navigate_to_step(target, case_id, report),
+            [active_case, report_output],
+            workflow_components,
+            show_progress="hidden",
+        )
 
     create_btn.click(
         create_case, [case_name, deposit, claimed, proposed, move_in, move_out],
@@ -1693,8 +1734,9 @@ with gr.Blocks(
         [audit_output, report_output, report_file, deductions_view],
         show_progress="full",
     ).then(
-        lambda: (*_workflow_visibility(4)[:5], ""),
-        outputs=[case_step, evidence_step, review_step, report_step, stepper, workflow_message],
+        lambda case_id, report: _navigate_to_step(4, case_id, report),
+        [active_case, report_output],
+        workflow_components,
     )
     gr.HTML(
         '<noscript><p>JavaScript is required to navigate this interactive audit application.</p></noscript>'
