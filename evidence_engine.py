@@ -506,6 +506,76 @@ def clause_status(payload: dict, clauses: list[dict]) -> str:
 # --------------------------------------------------------------------------
 # Classification rules
 # --------------------------------------------------------------------------
+def evaluate_locality_benchmark(payload: dict) -> dict | None:
+    """Compare a deduction amount with a matching selected-locality sample range."""
+    locality = payload.get("locality_benchmarks")
+    if not locality:
+        return None
+
+    common = {
+        "city": locality.get("city"),
+        "locality": locality.get("locality"),
+        "source_dataset": locality.get("source_dataset"),
+        "sample_data_warning": locality.get("sample_data_warning"),
+    }
+    deduction_service_groups = deduction_groups(
+        payload.get("description", ""), payload.get("category")
+    )
+    matching_rates = [
+        rate for rate in locality.get("rates", [])
+        if deduction_service_groups & groups_for(str(rate.get("category") or ""))
+    ]
+    matched_groups = {
+        group
+        for rate in matching_rates
+        for group in deduction_service_groups & groups_for(str(rate.get("category") or ""))
+    }
+    if not matching_rates or len(matched_groups) != 1:
+        return {**common, "status": "no_match"}
+
+    lower = min(float(rate["minimum"]) for rate in matching_rates)
+    upper = max(float(rate["maximum"]) for rate in matching_rates)
+    amount = _num(payload.get("amount"))
+    if amount is None:
+        return {**common, "status": "no_amount"}
+
+    if amount < lower:
+        position = "below"
+        difference = lower - amount
+        difference_percent = difference / lower * 100 if lower else None
+    elif amount > upper:
+        position = "above"
+        difference = amount - upper
+        difference_percent = difference / upper * 100 if upper else None
+    else:
+        position, difference, difference_percent = "within", 0.0, 0.0
+
+    category = " / ".join(sorted({str(rate["category"]) for rate in matching_rates}))
+    return {
+        **common,
+        "status": "matched",
+        "category": category,
+        "match_description": "Selected locality category sample range",
+        "record_count": len(matching_rates),
+        "lower": lower,
+        "upper": upper,
+        "claimed_amount": amount,
+        "position": position,
+        "difference": difference,
+        "difference_percent": difference_percent,
+        "matched_records": [
+            {
+                "city": locality.get("city"),
+                "locality": locality.get("locality"),
+                "category": str(rate["category"]),
+                "minimum": float(rate["minimum"]),
+                "maximum": float(rate["maximum"]),
+            }
+            for rate in matching_rates
+        ],
+    }
+
+
 def classify_deduction(payload: dict) -> dict:
     """
     Rules-based classification (no LLM). Transparent and conservative.
@@ -630,6 +700,7 @@ def classify_deduction(payload: dict) -> dict:
         "amount_status": inv["amount_status"],
         "photo_status": p_status,
         "inspection_findings": inspections,
+        "locality_benchmark": evaluate_locality_benchmark(payload),
     }
 
 

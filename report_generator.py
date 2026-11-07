@@ -31,13 +31,20 @@ def _assessment_modes_summary(findings) -> str:
     return "; ".join(f"{count} {label}" for label, count in counts.items()) or "No deduction findings."
 
 
-def _append_repair_benchmark(story, benchmark, styles) -> None:
+def _append_repair_benchmark(
+    story, benchmark, styles, heading="Repair-price benchmark (context only; does not determine classification)"
+) -> None:
     if not benchmark:
         return
-    story.append(Paragraph(
-        "Repair-price benchmark (context only; does not determine classification)",
-        styles["Heading3"]
-    ))
+    story.append(Paragraph(heading, styles["Heading3"]))
+    if benchmark.get("status") != "matched":
+        story.append(Paragraph(
+            "The deduction amount was unavailable for comparison."
+            if benchmark.get("status") == "no_amount"
+            else "No matching sample-rate category was available for this deduction at the selected locality.",
+            styles["SmallText"],
+        ))
+        return
     story.append(Paragraph(
         f"<b>Comparison:</b> {_text(benchmark.get('match_description', 'Sample-rate comparison'))}; "
         f"{_text(benchmark.get('city', ''))}"
@@ -341,6 +348,12 @@ def generate_audit_pdf(case, findings, totals, reports_dir: Path, photo_pairs=No
                 styles["SmallText"]
             ))
         _append_repair_benchmark(story, f.get("repair_price_benchmark"), styles)
+        _append_repair_benchmark(
+            story,
+            f.get("locality_benchmark"),
+            styles,
+            heading="Selected locality benchmark (context only; does not determine classification)",
+        )
         if f.get("ai_error"):
             story.append(Paragraph(
                 f"<b>Hosted AI unavailable:</b> {_text(f['ai_error'])[:1000]} (rules-based fallback used.)",

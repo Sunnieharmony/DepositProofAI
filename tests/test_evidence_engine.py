@@ -62,6 +62,29 @@ class EvidenceEngineTests(unittest.TestCase):
 
         self.assertEqual(result["classification"], ee.INSUFFICIENT)
 
+    def test_selected_locality_benchmark_compares_claim_without_changing_classification(self):
+        result = ee.classify_deduction({
+            "description": "Repainting the living room",
+            "category": "Painting / repainting",
+            "amount": 16000,
+            "locality_benchmarks": {
+                "city": "Bengaluru",
+                "locality": "HSR Layout",
+                "source_dataset": "rates.csv",
+                "sample_data_warning": "Sample data only.",
+                "rates": [{
+                    "category": "Painting / Repainting",
+                    "minimum": 8800,
+                    "maximum": 15400,
+                }],
+            },
+        })
+
+        self.assertEqual(result["classification"], ee.INSUFFICIENT)
+        self.assertEqual(result["locality_benchmark"]["status"], "matched")
+        self.assertEqual(result["locality_benchmark"]["position"], "above")
+        self.assertEqual(result["locality_benchmark"]["difference"], 600)
+
     def test_fabricated_quote_is_rejected(self):
         self.assertFalse(ee.verify_quote(
             "Tenant must replace all furniture.", "Tenant will keep the unit clean."

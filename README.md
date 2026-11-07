@@ -16,6 +16,9 @@ that a claim is false.
 ## Current features and limits
 
 - Create cases and enter each landlord deduction separately.
+- Remember the active draft ID in this browser's localStorage and offer
+  **Resume** only when it points to a valid saved case. No global saved-case
+  list is shown; case records and uploads remain stored by the application.
 - Extract text from text-based PDFs with PyMuPDF. Scanned PDFs are reported as
   unreadable; OCR is not installed or promised.
 - Extract invoice totals, dates, and descriptions with transparent Python

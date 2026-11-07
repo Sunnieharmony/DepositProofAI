@@ -116,12 +116,60 @@ class AppWorkflowTests(unittest.TestCase):
             [False, False, True, False],
         )
 
+    def test_local_draft_only_resumes_a_case_present_in_the_database(self):
+        empty_id, hidden_resume = app.prepare_local_draft("")
+        self.assertEqual(empty_id, "")
+        self.assertFalse(hidden_resume["visible"])
+
+        draft_id, visible_resume = app.prepare_local_draft(self.case_id)
+        self.assertEqual(draft_id, self.case_id)
+        self.assertTrue(visible_resume["visible"])
+
+        missing_id, hidden_missing_resume = app.prepare_local_draft("MISSING001")
+        self.assertEqual(missing_id, "")
+        self.assertFalse(hidden_missing_resume["visible"])
+
+        loaded_case, _, message = app.load_selected_case(self.case_id)
+        self.assertEqual(loaded_case, self.case_id)
+        self.assertIn(self.case_id, message)
+        missing_case, _, missing_message = app.load_selected_case("MISSING001")
+        self.assertEqual(missing_case, "")
+        self.assertIn("could not be found", missing_message)
+
+    def test_ui_uses_browser_storage_instead_of_a_global_case_dropdown(self):
+        config = app.demo.config
+        self.assertFalse(any(
+            component.get("props", {}).get("label") == "Saved cases"
+            for component in config.get("components", [])
+        ))
+        scripts = [
+            dependency.get("js") or ""
+            for dependency in config.get("dependencies", [])
+        ]
+        self.assertTrue(any(
+            app.ACTIVE_DRAFT_STORAGE_KEY in script and "getItem" in script
+            for script in scripts
+        ))
+        self.assertTrue(any(
+            app.ACTIVE_DRAFT_STORAGE_KEY in script and "setItem" in script
+            for script in scripts
+        ))
+        labels = {
+            component.get("props", {}).get("label")
+            for component in config.get("components", [])
+        }
+        self.assertNotIn("Associated invoice (optional)", labels)
+        self.assertNotIn("Associated photo pair (optional)", labels)
+        self.assertNotIn("Deduction to update", labels)
+
     def test_case_summary_displays_complete_id_without_model_configuration(self):
         with patch.object(app, "llm_is_configured", return_value=True):
-            case_id, summary, _ = app.create_case(
+            case_id, summary, saved_draft_id, resume_update = app.create_case(
                 "Visible case", 10000, 1000, 9000, None, None,
             )
 
+        self.assertEqual(saved_draft_id, case_id)
+        self.assertTrue(resume_update["visible"])
         self.assertIn(
             f'<h3>Case created: <span class="dp-case-id">{case_id}</span></h3>',
             summary,
@@ -147,12 +195,15 @@ class AppWorkflowTests(unittest.TestCase):
             [False, False, False, True],
         )
 
-    def test_photo_pair_can_be_linked_to_its_deduction(self):
+    def test_photo_upload_automatically_links_to_an_existing_deduction(self):
         root = Path(self.temp_dir.name)
         move_in = root / "move-in.png"
         move_out = root / "move-out.png"
         move_in.write_bytes(b"move-in test fixture")
         move_out.write_bytes(b"move-out test fixture")
+        app.add_deduction(
+            self.case_id, "Painting / repainting", "Repainting living room", 500,
+        )
         observation = {
             "observation": "A mark appears in the move-out image.",
             "visible_differences": ["A mark is visible."],
@@ -173,16 +224,40 @@ class AppWorkflowTests(unittest.TestCase):
         with app.db() as con:
             pair = con.execute("SELECT id,status FROM photo_pairs WHERE case_id=?", (self.case_id,)).fetchone()
         self.assertEqual(pair["status"], "llm_analyzed")
-        photo_choice = f"{pair['id']} — Living room wall (llm_analyzed)"
-        app.add_deduction(
-            self.case_id, "Painting / repainting", "Repainting living room", 500,
-            "None", photo_choice,
-        )
         with app.db() as con:
             deduction = con.execute(
                 "SELECT photo_pair_id FROM deductions WHERE case_id=?", (self.case_id,)
             ).fetchone()
         self.assertEqual(deduction["photo_pair_id"], pair["id"])
+
+    def test_invoice_upload_automatically_links_to_an_existing_deduction(self):
+        source = Path(self.temp_dir.name) / "painting-invoice.pdf"
+        source.write_bytes(b"fixture")
+        app.add_deduction(
+            self.case_id, "Painting / repainting", "Repainting living room", 500,
+        )
+        with patch.object(
+            app, "extract_pdf",
+            return_value=("Painting work total 500", {}, "extracted"),
+        ), patch.object(
+            app, "extract_invoice_fields",
+            return_value={"total_amount": 500, "service_description": "Painting work"},
+        ):
+            result, _ = app.upload_documents(
+                self.case_id, [str(source)], "Invoice / receipt",
+            )
+
+        self.assertIn("painting-invoice.pdf", result)
+        with app.db() as con:
+            deduction = con.execute(
+                "SELECT invoice_document_id FROM deductions WHERE case_id=?",
+                (self.case_id,),
+            ).fetchone()
+            invoice = con.execute(
+                "SELECT filename FROM documents WHERE id=?",
+                (deduction["invoice_document_id"],),
+            ).fetchone()
+        self.assertEqual(invoice["filename"], "painting-invoice.pdf")
 
     def test_photo_upload_shows_clear_error_when_analysis_fails(self):
         root = Path(self.temp_dir.name)
@@ -223,6 +298,45 @@ class AppWorkflowTests(unittest.TestCase):
             json.loads(findings[0]["finding_json"])["classification"],
             "Insufficiently Documented",
         )
+
+    def test_selected_locality_benchmarks_reach_the_evidence_engine(self):
+        self.assertIn("HSR Layout, Bengaluru", app.LOCALITY_CHOICES)
+        locality_data = app.get_locality_benchmarks("HSR Layout, Bengaluru")
+        self.assertEqual(locality_data["city"], "Bengaluru")
+        self.assertEqual(locality_data["locality"], "HSR Layout")
+        painting_rate = next(
+            rate for rate in locality_data["rates"]
+            if rate["category"] == "Painting / Repainting"
+        )
+        self.assertEqual((painting_rate["minimum"], painting_rate["maximum"]), (8800, 15400))
+
+        with app.db() as con:
+            con.execute(
+                """INSERT INTO deductions(id,case_id,category,description,amount,created_at)
+                   VALUES(?,?,?,?,?,?)""",
+                ("LOCALITY01", self.case_id, "Painting / repainting",
+                 "Repainting the living room", 16000, "2025-01-01T00:00:00"),
+            )
+        with patch.object(app, "llm_is_configured", return_value=False), \
+                patch.object(app, "classify_deduction", wraps=app.classify_deduction) as classify:
+            markdown, pdf_path, _ = app.run_audit(
+                self.case_id, "HSR Layout, Bengaluru"
+            )
+
+        payload = classify.call_args.args[0]
+        self.assertEqual(payload["locality_benchmarks"], locality_data)
+        self.assertEqual(payload["photo_observation"], None)
+        self.assertIn("Selected locality benchmark — context only", markdown)
+        self.assertIn("Claim position: above", markdown)
+        self.assertTrue(Path(pdf_path).is_file())
+        with app.db() as con:
+            finding = con.execute(
+                "SELECT finding_json FROM findings WHERE deduction_id=?",
+                ("LOCALITY01",),
+            ).fetchone()
+        saved_finding = json.loads(finding["finding_json"])
+        self.assertEqual(saved_finding["locality_benchmark"]["difference"], 600)
+        self.assertEqual(saved_finding["classification"], "Insufficiently Documented")
 
     def test_saved_price_benchmark_is_reported_without_changing_classification(self):
         with app.db() as con:
@@ -345,11 +459,10 @@ class AppWorkflowTests(unittest.TestCase):
                  "llm_analyzed", "2025-01-01"),
             )
             con.execute(
-                """INSERT INTO deductions(id,case_id,category,description,amount,invoice_document_id,
-                   photo_pair_id,created_at)
-                   VALUES(?,?,?,?,?,?,?,?)""",
+                """INSERT INTO deductions(id,case_id,category,description,amount,created_at)
+                   VALUES(?,?,?,?,?,?)""",
                 ("DEDUCTION02", self.case_id, "Painting / repainting",
-                 "Repainting living room wall", 500, "INVOICE0001", "PHOTO000001", "2025-01-01"),
+                 "Repainting living room wall", 500, "2025-01-01"),
             )
 
         with patch.object(app, "llm_is_configured", return_value=False):
@@ -364,6 +477,16 @@ class AppWorkflowTests(unittest.TestCase):
         self.assertEqual(result["classification"], "Supported")
         self.assertTrue(result["clauses"][0]["quote_verified"])
         self.assertEqual(result["clauses"][0]["page"], "1")
+        self.assertEqual(result["invoice"]["filename"], "painting.pdf")
+        self.assertEqual(result["photo_item_name"], "Living room wall")
+        self.assertIn("A visible paint mark is present.", result["photo_observation"]["observation"])
+        with app.db() as con:
+            linked = con.execute(
+                "SELECT invoice_document_id,photo_pair_id FROM deductions WHERE id=?",
+                ("DEDUCTION02",),
+            ).fetchone()
+        self.assertEqual(linked["invoice_document_id"], "INVOICE0001")
+        self.assertEqual(linked["photo_pair_id"], "PHOTO000001")
 
     def test_mixed_assessment_modes_and_photo_observations_are_reported_per_deduction(self):
         observation = {

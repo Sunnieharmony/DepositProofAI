@@ -7,6 +7,7 @@ are clearly marked and must never be represented as real AI analysis.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import html
 import os
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any, Generator
 
 import gradio as gr
+import pandas as pd
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
@@ -27,10 +29,14 @@ load_dotenv(dotenv_path=ROOT / ".env")
 from document_processing import extract_inspection_fields, extract_pdf
 from evidence_engine import (
     classify_deduction,
+    evaluate_locality_benchmark,
     extract_invoice_fields,
     find_relevant_clauses,
+    deduction_groups,
+    groups_for,
     money_text,
     retrieve_topic_passages,
+    terms_for,
     verify_quote,
 )
 from llm_integration import (
@@ -44,7 +50,9 @@ from llm_integration import (
 )
 from report_generator import generate_audit_pdf
 from repair_price_intelligence import (
+    DATASET_PATH,
     DATASET_NAME,
+    SAMPLE_DATA_WARNING,
     RepairRateDataError,
     compare_repair_price,
     load_repair_rates,
@@ -53,6 +61,30 @@ from repair_price_intelligence import (
 UPLOADS = ROOT / "uploads"
 REPORTS = ROOT / "reports"
 DB_PATH = ROOT / "data" / "depositproof.sqlite3"
+ACTIVE_DRAFT_STORAGE_KEY = "depositproof.activeDraftCaseId"
+LOCALITY_DATA = pd.read_csv(DATASET_PATH)
+LOCALITY_REQUIRED_COLUMNS = {
+    "City", "Locality / Area", "Category", "Min Price (₹)", "Max Price (₹)",
+}
+missing_locality_columns = LOCALITY_REQUIRED_COLUMNS - set(LOCALITY_DATA.columns)
+if missing_locality_columns:
+    raise RepairRateDataError(
+        "Repair-rate dataset is missing required columns: "
+        + ", ".join(sorted(missing_locality_columns))
+    )
+LOCALITY_DATA["Min Price (₹)"] = pd.to_numeric(
+    LOCALITY_DATA["Min Price (₹)"], errors="raise"
+)
+LOCALITY_DATA["Max Price (₹)"] = pd.to_numeric(
+    LOCALITY_DATA["Max Price (₹)"], errors="raise"
+)
+LOCALITY_BY_LABEL = {
+    f"{locality}, {city}": (city, locality)
+    for city, locality in LOCALITY_DATA[["City", "Locality / Area"]]
+    .drop_duplicates()
+    .itertuples(index=False, name=None)
+}
+LOCALITY_CHOICES = sorted(LOCALITY_BY_LABEL, key=str.casefold)
 UPLOADS.mkdir(exist_ok=True)
 REPORTS.mkdir(exist_ok=True)
 DB_PATH.parent.mkdir(exist_ok=True)
@@ -126,6 +158,35 @@ def money(value: Any, currency: str = "INR") -> str:
         n = 0.0
     symbol = "₹" if currency == "INR" else currency + " "
     return f"{symbol}{n:,.2f}".replace(".00", "")
+
+
+def get_locality_benchmarks(selection: str | None) -> dict[str, Any] | None:
+    """Return all sample rate categories for one selected locality."""
+    if not selection:
+        return None
+    selected = LOCALITY_BY_LABEL.get(selection)
+    if selected is None:
+        raise ValueError(f"Unknown locality selection: {selection}")
+    city, locality = selected
+    rows = LOCALITY_DATA.loc[
+        (LOCALITY_DATA["City"] == city)
+        & (LOCALITY_DATA["Locality / Area"] == locality)
+    ]
+    rates = [
+        {
+            "category": str(category),
+            "minimum": float(category_rows["Min Price (₹)"].min()),
+            "maximum": float(category_rows["Max Price (₹)"].max()),
+        }
+        for category, category_rows in rows.groupby("Category", sort=True)
+    ]
+    return {
+        "city": city,
+        "locality": locality,
+        "source_dataset": DATASET_NAME,
+        "sample_data_warning": SAMPLE_DATA_WARNING,
+        "rates": rates,
+    }
 
 
 def _assessment_method(finding: dict) -> str:
@@ -321,7 +382,7 @@ def create_case(name, deposit, claimed, proposed, move_in, move_out):
         f"{'⚠️ The proposed refund differs from the calculated refund.' if proposed is not None and abs(proposed-calculated) > 0.01 else 'Financial arithmetic checked.'}\n\n"
         f"{ai_status_markdown()}"
     )
-    return case_id, msg, gr.update(choices=list_cases())
+    return case_id, msg, case_id, gr.update(visible=True)
 
 
 def ai_status_markdown() -> str:
@@ -331,23 +392,11 @@ def ai_status_markdown() -> str:
     return "**AI status:** AI-assisted analysis is unavailable; rules-based assessment remains available."
 
 
-def list_cases():
-    with db() as con:
-        rows = con.execute("SELECT id,name,created_at FROM cases ORDER BY created_at DESC").fetchall()
-    return [f"{r['id']} — {r['name']} ({r['created_at']})" for r in rows]
-
-
-def parse_case_choice(choice: str | None) -> str | None:
-    if not choice:
-        return None
-    return choice.split(" — ", 1)[0].strip()
-
-
 def upload_documents(case_id, files, category):
     if not case_id:
         raise gr.Error("Create a case first.")
     if not files:
-        return "No files selected.", gr.update()
+        return "No files selected.", refresh_deductions(case_id)
     results = []
     for item in files:
         src = item if isinstance(item, str) else getattr(item, "name", None)
@@ -384,9 +433,10 @@ def upload_documents(case_id, files, category):
         ok = status.startswith("extracted")
         flag = "✅" if ok and "partial" not in status else "⚠️"
         results.append(f"- {flag} **{filename}** ({category}) — {status}; {len(text)} characters extracted.")
+    _auto_link_case_evidence(case_id)
     return ("### Upload results\n\n" + ("\n".join(results) if results else "No valid files were processed.")
             + "\n\nFiles that could not be read are stored but **not** analysed; the audit will say so rather than guess."), \
-        gr.update(choices=document_choices(case_id), value="None")
+        refresh_deductions(case_id)
 
 
 def documents_for_case(case_id):
@@ -401,20 +451,106 @@ def _choice_id(choice: str | None) -> str | None:
     return choice.split(" — ", 1)[0].strip()
 
 
-def photo_choices(case_id):
-    if not case_id:
-        return ["None"]
-    with db() as con:
-        rows = con.execute("SELECT id,item_name,status FROM photo_pairs WHERE case_id=? ORDER BY created_at", (case_id,)).fetchall()
-    return ["None"] + [f"{r['id']} — {r['item_name']} ({r['status']})" for r in rows]
-
-
 def deduction_choices(case_id):
     if not case_id:
         return []
     with db() as con:
         rows = con.execute("SELECT id,description,amount FROM deductions WHERE case_id=? ORDER BY created_at", (case_id,)).fetchall()
     return [f"{r['id']} — {r['description']} ({money(r['amount'])})" for r in rows]
+
+
+_EVIDENCE_LOCATION_WORDS = {
+    "apartment", "bath", "bathroom", "bed", "bedroom", "entry", "hall", "kitchen",
+    "living", "lobby", "room", "study",
+}
+
+
+def _evidence_match_score(description, category, evidence_text):
+    description = str(description or "")
+    evidence_text = str(evidence_text or "")
+    shared_groups = deduction_groups(description, category) & groups_for(evidence_text)
+    description_terms = terms_for(description) - _EVIDENCE_LOCATION_WORDS
+    evidence_terms = terms_for(evidence_text) - _EVIDENCE_LOCATION_WORDS
+    shared_terms = description_terms & evidence_terms
+    return len(shared_groups) * 5 + len(shared_terms) * 2
+
+
+def _invoice_match_text(document):
+    invoice_fields = json.loads(document["invoice_json"] or "{}")
+    service_description = invoice_fields.get("service_description")
+    invoice_text = service_description or (document["extracted_text"] or "")[:2000]
+    return " ".join((document["filename"], invoice_text))
+
+
+def _best_evidence_match(deduction, candidates, used_ids, label_for):
+    scored = [
+        (
+            _evidence_match_score(
+                deduction["description"],
+                deduction["category"],
+                label_for(candidate),
+            ),
+            candidate,
+        )
+        for candidate in candidates
+        if candidate["id"] not in used_ids
+    ]
+    scored = [(score, candidate) for score, candidate in scored if score > 0]
+    if not scored:
+        return None
+    best_score = max(score for score, _ in scored)
+    best = [candidate for score, candidate in scored if score == best_score]
+    return best[0] if len(best) == 1 else None
+
+
+def _auto_link_case_evidence(case_id):
+    """Persist unique keyword matches while leaving ambiguous evidence unlinked."""
+    with db() as con:
+        deductions = con.execute(
+            "SELECT * FROM deductions WHERE case_id=? ORDER BY created_at,id", (case_id,)
+        ).fetchall()
+        invoices = con.execute(
+            """SELECT * FROM documents WHERE case_id=?
+               AND category IN ('Invoice / receipt','Deduction statement')
+               ORDER BY created_at,id""",
+            (case_id,),
+        ).fetchall()
+        photos = con.execute(
+            "SELECT * FROM photo_pairs WHERE case_id=? ORDER BY created_at,id", (case_id,)
+        ).fetchall()
+        used_invoice_ids = {row["invoice_document_id"] for row in deductions if row["invoice_document_id"]}
+        used_photo_ids = {row["photo_pair_id"] for row in deductions if row["photo_pair_id"]}
+
+        for row in deductions:
+            updates = {}
+            deduction = dict(row)
+            if not row["invoice_document_id"]:
+                invoice = _best_evidence_match(
+                    deduction,
+                    invoices,
+                    used_invoice_ids,
+                    _invoice_match_text,
+                )
+                if invoice:
+                    updates["invoice_document_id"] = invoice["id"]
+                    used_invoice_ids.add(invoice["id"])
+            if not row["photo_pair_id"]:
+                photo = _best_evidence_match(
+                    deduction,
+                    photos,
+                    used_photo_ids,
+                    lambda pair: pair["item_name"],
+                )
+                if photo:
+                    updates["photo_pair_id"] = photo["id"]
+                    used_photo_ids.add(photo["id"])
+            if updates:
+                assignments = ", ".join(f"{column}=?" for column in updates)
+                con.execute(
+                    f"UPDATE deductions SET {assignments}, status=NULL, assessment_json=NULL "
+                    "WHERE id=? AND case_id=?",
+                    (*updates.values(), row["id"], case_id),
+                )
 
 
 def prefill_benchmark_deduction(case_id, deduction_choice):
@@ -677,7 +813,7 @@ def _owned_id(con, table: str, item_id: str | None, case_id: str) -> str | None:
     return item_id
 
 
-def add_deduction(case_id, category, description, amount, invoice_choice, photo_choice=None):
+def add_deduction(case_id, category, description, amount):
     if not case_id:
         raise gr.Error("Create a case first.")
     if not description or not str(description).strip():
@@ -690,35 +826,15 @@ def add_deduction(case_id, category, description, amount, invoice_choice, photo_
         raise gr.Error("Deduction amount cannot be negative.")
     deduction_id = uuid.uuid4().hex[:12]
     with db() as con:
-        invoice_id = _owned_id(con, "documents", _choice_id(invoice_choice), case_id)
-        photo_id = _owned_id(con, "photo_pairs", _choice_id(photo_choice), case_id)
         con.execute(
             """INSERT INTO deductions(id,case_id,category,description,amount,
                invoice_document_id,photo_pair_id,created_at) VALUES(?,?,?,?,?,?,?,?)""",
             (deduction_id, case_id, category, str(description).strip(), amount,
-             invoice_id, photo_id, datetime.now().isoformat(timespec="seconds"))
+             None, None, datetime.now().isoformat(timespec="seconds"))
         )
+    _auto_link_case_evidence(case_id)
     return (f"Added deduction `{deduction_id}`: **{description} — {money(amount)}**",
-            refresh_deductions(case_id),
-            gr.update(choices=deduction_choices(case_id), value=None))
-
-
-def link_evidence(case_id, deduction_choice, invoice_choice, photo_choice):
-    """Attach (or change) the invoice and/or photo pair of an EXISTING deduction. Persisted in SQLite."""
-    if not case_id:
-        raise gr.Error("Create a case first.")
-    deduction_id = _choice_id(deduction_choice)
-    if not deduction_id:
-        raise gr.Error("Select a deduction first.")
-    with db() as con:
-        _owned_id(con, "deductions", deduction_id, case_id)
-        invoice_id = _owned_id(con, "documents", _choice_id(invoice_choice), case_id)
-        photo_id = _owned_id(con, "photo_pairs", _choice_id(photo_choice), case_id)
-        con.execute("UPDATE deductions SET invoice_document_id=?, photo_pair_id=?, status=NULL, assessment_json=NULL WHERE id=? AND case_id=?",
-                    (invoice_id, photo_id, deduction_id, case_id))
-    return ("Evidence links saved. Invoice: "
-            f"{invoice_choice if invoice_id else 'none'}; photo pair: {photo_choice if photo_id else 'none'}. Re-run the audit to refresh results."), \
-        refresh_deductions(case_id)
+            refresh_deductions(case_id))
 
 
 def remove_deduction(case_id, deduction_choice):
@@ -731,17 +847,6 @@ def remove_deduction(case_id, deduction_choice):
         _owned_id(con, "deductions", deduction_id, case_id)
         con.execute("DELETE FROM deductions WHERE id=? AND case_id=?", (deduction_id, case_id))
     return "Deduction removed.", refresh_deductions(case_id), gr.update(choices=deduction_choices(case_id), value=None)
-
-
-def document_choices(case_id):
-    if not case_id:
-        return ["None"]
-    with db() as con:
-        rows = con.execute(
-            "SELECT id,filename FROM documents WHERE case_id=? AND category IN ('Invoice / receipt','Deduction statement')",
-            (case_id,)
-        ).fetchall()
-    return ["None"] + [f"{r['id']} — {r['filename']}" for r in rows]
 
 
 def refresh_deductions(case_id):
@@ -768,9 +873,11 @@ def refresh_deductions(case_id):
     return "\n".join(lines)
 
 
-def run_audit(case_id):
+def run_audit(case_id, locality_selection=None):
     if not case_id:
         raise gr.Error("Create a case first.")
+    locality_benchmarks = get_locality_benchmarks(locality_selection)
+    _auto_link_case_evidence(case_id)
     with db() as con:
         case = con.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
         deductions = con.execute("SELECT * FROM deductions WHERE case_id=?", (case_id,)).fetchall()
@@ -818,17 +925,19 @@ def run_audit(case_id):
         related_photo = next((p for p in photos if p["id"] == deduction.get("photo_pair_id")), None)
         photo_observation = json.loads(related_photo["observation_json"]) if related_photo and related_photo["observation_json"] else None
 
+        deduction.update({
+            "invoice": invoice,
+            "photo_observation": photo_observation,
+            "photo_item_name": related_photo["item_name"] if related_photo else None,
+        })
         payload = {
-            "description": deduction["description"],
-            "category": deduction["category"],
-            "amount": deduction["amount"],
+            **deduction,
             "currency": case["currency"],
             "case_dates": {"move_in": case["move_in"], "move_out": case["move_out"]},
             "clauses": clauses,
             "agreement_available": bool(agreement_texts),
             "agreement_problem": agreement_problem,
-            "invoice": invoice,
-            "photo_observation": photo_observation,
+            "locality_benchmarks": locality_benchmarks,
             "inspection_documents": [
                 {"filename": d["filename"], "text": (d["extracted_text"] or "")[:5000]}
                 for d in docs if d["category"] == "Inspection report"
@@ -847,6 +956,7 @@ def run_audit(case_id):
         else:
             assessment = classify_deduction(payload)
             assessment["mode"] = "rules_fallback_not_llm"
+        assessment["locality_benchmark"] = evaluate_locality_benchmark(payload)
         assessment.setdefault("rules_classification", assessment.get("classification"))
         assessment["assessment_method"] = _assessment_method(assessment)
         assessment["clauses"] = clauses
@@ -970,6 +1080,35 @@ def run_audit(case_id):
                 lines.append(
                     f"- Optional hosted-model explanation (does not change the calculation): {benchmark['llm_explanation']}"
                 )
+        locality_benchmark = f.get("locality_benchmark")
+        if locality_benchmark:
+            lines.extend(["", "### Selected locality benchmark — context only"])
+            if locality_benchmark.get("status") == "matched":
+                lines.extend([
+                    f"- Comparison: {locality_benchmark['category']} in "
+                    f"{locality_benchmark['locality']}, {locality_benchmark['city']}.",
+                    f"- Sample range: {money(locality_benchmark['lower'])}–"
+                    f"{money(locality_benchmark['upper'])}.",
+                    f"- Claim position: {locality_benchmark['position']}; difference from nearest boundary: "
+                    f"{money(locality_benchmark['difference'])}."
+                    + (f" ({locality_benchmark['difference_percent']:.1f}%)"
+                       if locality_benchmark.get("difference_percent") is not None
+                       and locality_benchmark["position"] != "within" else ""),
+                ])
+            else:
+                if locality_benchmark.get("status") == "no_amount":
+                    lines.append("- The deduction amount was unavailable for comparison.")
+                else:
+                    lines.append(
+                        f"- No matching locality price category was available for "
+                        f"{locality_benchmark.get('locality', 'the selected locality')}, "
+                        f"{locality_benchmark.get('city', '')}."
+                    )
+            lines.extend([
+                f"- Source: {locality_benchmark['source_dataset']}. "
+                f"{locality_benchmark['sample_data_warning']}",
+                "- This sample comparison is contextual only and does not determine the evidence classification.",
+            ])
         if f.get("ai_error"):
             lines.extend(["", f"**Hosted AI unavailable:** {f['ai_error']} (rules-based fallback used.)"])
     linked_photo_ids = {f.get("photo_pair_id") for f in report_findings if f.get("photo_pair_id")}
@@ -1038,12 +1177,13 @@ def upload_photo_pair(case_id, item_name, move_in_file, move_out_file):
             (pair_id, case_id, str(item_name).strip(), move_in_path, move_out_path,
              json.dumps(observation, ensure_ascii=False), mode, datetime.now().isoformat(timespec="seconds"))
         )
+    _auto_link_case_evidence(case_id)
     detail = f"Photo pair saved for **{item_name}**. Status: `{mode}`. Pair ID: `{pair_id}`"
     detail += "\n\n" + _photo_upload_result_markdown(
         observation if mode == "llm_analyzed" else None,
         analysis_error,
     )
-    return detail, gr.update(choices=photo_choices(case_id), value=f"{pair_id} — {str(item_name).strip()} ({mode})")
+    return detail, refresh_deductions(case_id)
 
 
 def analyze_agreement(case_id):
@@ -1069,15 +1209,23 @@ def analyze_agreement(case_id):
     return "\n\n".join(outputs)
 
 
-def load_selected_case(choice):
-    case_id = parse_case_choice(choice)
+def prepare_local_draft(case_id):
+    if not case_id or _active_case_problem(case_id):
+        return "", gr.update(visible=False)
+    return case_id, gr.update(visible=True)
+
+
+def load_selected_case(case_id):
+    if not case_id or _active_case_problem(case_id):
+        return (
+            "",
+            refresh_deductions(None),
+            "The saved draft could not be found. Create a new case to continue.",
+        )
     return (
-        case_id or "",
+        case_id,
         refresh_deductions(case_id),
-        gr.update(choices=document_choices(case_id), value="None"),
-        gr.update(choices=photo_choices(case_id), value="None"),
-        gr.update(choices=deduction_choices(case_id), value=None),
-        f"Loaded case `{case_id}`." if case_id else "Select a saved case first.",
+        f"Loaded case `{case_id}`.",
     )
 
 def _workflow_visibility(active_step: int):
@@ -1148,8 +1296,8 @@ def _continue_from_review(report_markdown):
     return _navigate_to_step(4, None, report_markdown)
 
 
-def _run_audit_for_workflow(case_id):
-    markdown, pdf_path, deductions = run_audit(case_id)
+def _run_audit_for_workflow(case_id, locality_selection=None):
+    markdown, pdf_path, deductions = run_audit(case_id, locality_selection)
     return markdown, markdown, pdf_path, deductions
 
 
@@ -1363,6 +1511,10 @@ html, body, .gradio-container {
 }
 """
 
+APP_CSS = DESIGN_CSS + """
+footer { visibility: hidden !important; display: none !important; }
+.gradio-container .footer { display: none !important; }
+"""
 
 with gr.Blocks(
     title="DepositProof AI",
@@ -1426,7 +1578,7 @@ with gr.Blocks(
         with gr.Column(visible=True, elem_classes=["dp-workflow-panel"]) as case_step:
             gr.HTML(
                 '<h2 class="dp-section-title">1. Set up your audit case</h2>'
-                '<p class="dp-section-copy">Add the deposit details, then create a new case or return to one you saved earlier.</p>'
+                '<p class="dp-section-copy">Add the deposit details, then create a new case or resume the draft remembered by this browser.</p>'
             )
             with gr.Row(elem_classes=["dp-case-layout"]):
                 with gr.Column(scale=3, elem_classes=["dp-case-card"]):
@@ -1441,16 +1593,15 @@ with gr.Blocks(
                         move_out = gr.Textbox(label="Move-out date (optional)", placeholder="YYYY-MM-DD")
                     create_btn = gr.Button("Create audit case", variant="primary")
                     active_case = gr.Textbox(label="Active case ID", interactive=False)
+                    browser_draft_id = gr.Textbox(visible=False)
                     case_message = gr.Markdown(
                         elem_classes=["dp-result-block", "dp-case-summary"]
                     )
                 with gr.Column(scale=2, elem_classes=["dp-case-card"]):
-                    gr.HTML('<h3 class="dp-subsection">Continue a saved case</h3>')
-                    case_dropdown = gr.Dropdown(label="Saved cases", choices=list_cases(), interactive=True)
-                    load_btn = gr.Button("Load selected case")
+                    resume_btn = gr.Button("Resume", visible=False)
                     load_result = gr.Markdown(elem_classes=["dp-result-block"])
                     gr.HTML(
-                        '<div class="dp-inline-note">Case data and uploads are stored locally in SQLite and the project upload folder.</div>'
+                        '<div class="dp-inline-note">This browser remembers the active case ID; case details and uploads remain stored by this application.</div>'
                     )
             with gr.Row(elem_classes=["dp-action-row"]):
                 gr.HTML('<span class="dp-action-spacer"></span>')
@@ -1459,7 +1610,7 @@ with gr.Blocks(
         with gr.Column(visible=False, elem_classes=["dp-workflow-panel"]) as evidence_step:
             gr.HTML(
                 '<h2 class="dp-section-title">2. Add the supporting evidence</h2>'
-                '<p class="dp-section-copy">Upload readable documents, compare a matched photo pair, enter itemised claims, and optionally compare a repair price with the sample dataset.</p>'
+                '<p class="dp-section-copy">Upload readable documents, select a locality for sample price comparisons, compare a matched photo pair, and enter itemised claims.</p>'
             )
             gr.HTML('<h3 class="dp-subsection">Rental documents</h3>')
             gr.HTML(
@@ -1484,14 +1635,24 @@ with gr.Blocks(
                 upload_btn = gr.Button("Upload and extract", variant="primary")
                 llm_extract_btn = gr.Button("Review agreement details with hosted model")
             upload_output = gr.Markdown(elem_classes=["dp-result-block"])
+            locality_dropdown = gr.Dropdown(
+                choices=LOCALITY_CHOICES,
+                value=None,
+                label="Select Locality / Area",
+            )
+            gr.HTML(
+                '<p class="dp-upload-help">When selected, locality-specific painting, cleaning, plumbing, '
+                'electrical, and carpentry sample ranges are compared with relevant claimed deductions. '
+                'These sample rates provide context only and do not determine the evidence classification.</p>'
+            )
             llm_extract_output = gr.Markdown(elem_classes=["dp-result-block"])
             llm_extract_btn.click(
                 analyze_agreement, [active_case], [llm_extract_output],
                 show_progress="full",
             )
 
-            with gr.Accordion("Itemised deductions and evidence links", open=True):
-                gr.HTML('<p class="dp-upload-help">Enter each landlord claim separately. Link the invoice and photo comparison that relate to that specific deduction.</p>')
+            with gr.Accordion("Itemised deductions", open=True):
+                gr.HTML('<p class="dp-upload-help">Enter each landlord claim separately. Uploaded invoices and photo pairs are matched to deductions using the description and evidence keywords; uncertain matches are left unlinked.</p>')
                 with gr.Row():
                     deduction_category = gr.Dropdown(
                         ["Painting / repainting", "Cleaning", "Furniture damage", "Appliance damage",
@@ -1500,34 +1661,13 @@ with gr.Blocks(
                     )
                     deduction_amount = gr.Number(label="Claimed amount (₹)", value=1000, minimum=0)
                 deduction_description = gr.Textbox(label="Deduction description", placeholder="e.g. Repainting the living room")
-                with gr.Row():
-                    invoice_dropdown = gr.Dropdown(label="Associated invoice (optional)", choices=["None"], value="None")
-                    photo_dropdown = gr.Dropdown(label="Associated photo pair (optional)", choices=["None"], value="None")
-                link_deduction_dropdown = gr.Dropdown(label="Deduction to update", choices=[], value=None)
-                refresh_invoice_choices = gr.Button("Refresh evidence lists")
-                refresh_invoice_choices.click(
-                    lambda c: (
-                        gr.update(choices=document_choices(c), value="None"),
-                        gr.update(choices=photo_choices(c), value="None"),
-                        gr.update(choices=deduction_choices(c), value=None),
-                    ),
-                    [active_case], [invoice_dropdown, photo_dropdown, link_deduction_dropdown],
-                )
                 add_deduction_btn = gr.Button("Add deduction", variant="primary")
                 deduction_output = gr.Markdown(elem_classes=["dp-result-block"])
                 deductions_view = gr.Markdown(elem_classes=["dp-result-block"])
                 add_deduction_btn.click(
                     add_deduction,
-                    [active_case, deduction_category, deduction_description, deduction_amount,
-                     invoice_dropdown, photo_dropdown],
-                    [deduction_output, deductions_view, link_deduction_dropdown],
-                )
-                gr.Markdown("**Attach evidence to an existing deduction**")
-                link_evidence_btn = gr.Button("Save evidence links")
-                link_evidence_output = gr.Markdown(elem_classes=["dp-result-block"])
-                link_evidence_btn.click(
-                    link_evidence, [active_case, link_deduction_dropdown, invoice_dropdown, photo_dropdown],
-                    [link_evidence_output, deductions_view],
+                    [active_case, deduction_category, deduction_description, deduction_amount],
+                    [deduction_output, deductions_view],
                 )
 
             with gr.Accordion("Move-in and move-out photographs", open=True):
@@ -1630,9 +1770,7 @@ with gr.Blocks(
             )
             with gr.Row():
                 audit_btn = gr.Button("Run evidence audit", variant="primary")
-                show_deductions_btn = gr.Button("Refresh deduction list")
             audit_output = gr.Markdown(elem_classes=["dp-result-block", "dp-report"])
-            show_deductions_btn.click(refresh_deductions, [active_case], [deductions_view])
             with gr.Row(elem_classes=["dp-action-row"]):
                 review_back = gr.Button("Back to evidence")
                 gr.HTML('<span class="dp-action-spacer"></span>')
@@ -1704,22 +1842,37 @@ with gr.Blocks(
             show_progress="hidden",
         )
 
+    demo.load(
+        prepare_local_draft,
+        [browser_draft_id],
+        [browser_draft_id, resume_btn],
+        js=f"() => [window.localStorage.getItem('{ACTIVE_DRAFT_STORAGE_KEY}') || '']",
+        show_progress="hidden",
+    )
     create_btn.click(
         create_case, [case_name, deposit, claimed, proposed, move_in, move_out],
-        [active_case, case_message, case_dropdown],
+        [active_case, case_message, browser_draft_id, resume_btn],
+    ).then(
+        fn=None,
+        inputs=[active_case],
+        outputs=[],
+        js=f"""(caseId) => {{
+            if (caseId) window.localStorage.setItem('{ACTIVE_DRAFT_STORAGE_KEY}', caseId);
+            return [];
+        }}""",
+        show_progress="hidden",
     )
-    load_btn.click(
-        load_selected_case, [case_dropdown],
-        [active_case, deductions_view, invoice_dropdown, photo_dropdown,
-         link_deduction_dropdown, load_result],
+    resume_btn.click(
+        load_selected_case, [browser_draft_id],
+        [active_case, deductions_view, load_result],
     )
     upload_btn.click(
         upload_documents, [active_case, document_files, upload_category],
-        [upload_output, invoice_dropdown], show_progress="full",
+        [upload_output, deductions_view], show_progress="full",
     )
     photo_btn.click(
         upload_photo_pair, [active_case, photo_item, photo_in, photo_out],
-        [photo_output, photo_dropdown], show_progress="full",
+        [photo_output, deductions_view], show_progress="full",
     )
     photo_in.change(
         lambda path: gr.update(value=path, visible=bool(path)),
@@ -1730,7 +1883,7 @@ with gr.Blocks(
         [photo_out], [photo_out_preview], show_progress="hidden",
     )
     audit_btn.click(
-        _run_audit_for_workflow, [active_case],
+        _run_audit_for_workflow, [active_case, locality_dropdown],
         [audit_output, report_output, report_file, deductions_view],
         show_progress="full",
     ).then(
@@ -1744,11 +1897,14 @@ with gr.Blocks(
 
 
 if __name__ == "__main__":
-    demo.launch(
-        theme=gr.themes.Base(
+    launch_kwargs = {
+        "theme": gr.themes.Base(
             primary_hue="blue",
             secondary_hue="slate",
             neutral_hue="slate",
         ),
-        css=DESIGN_CSS,
-    )
+        "css": APP_CSS,
+    }
+    if "show_api" in inspect.signature(gr.Blocks.launch).parameters:
+        launch_kwargs["show_api"] = False
+    demo.launch(**launch_kwargs)
