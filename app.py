@@ -15,7 +15,7 @@ import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Generator
 
@@ -24,7 +24,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=ROOT / ".env")
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
 
 from document_processing import extract_inspection_fields, extract_pdf
 from evidence_engine import (
@@ -40,11 +40,10 @@ from evidence_engine import (
     verify_quote,
 )
 from llm_integration import (
-    analyze_agreement_with_llm,
     analyze_image_pair_with_llm,
     assess_deduction_with_llm,
+    get_configuration_error,
     get_last_error,
-    explain_repair_benchmark_with_llm,
     llm_is_configured,
     validate_image_file,
 )
@@ -61,7 +60,6 @@ from repair_price_intelligence import (
 UPLOADS = ROOT / "uploads"
 REPORTS = ROOT / "reports"
 DB_PATH = ROOT / "data" / "depositproof.sqlite3"
-ACTIVE_DRAFT_STORAGE_KEY = "depositproof.activeDraftCaseId"
 LOCALITY_DATA = pd.read_csv(DATASET_PATH)
 LOCALITY_REQUIRED_COLUMNS = {
     "City", "Locality / Area", "Category", "Min Price (₹)", "Max Price (₹)",
@@ -85,6 +83,26 @@ LOCALITY_BY_LABEL = {
     .itertuples(index=False, name=None)
 }
 LOCALITY_CHOICES = sorted(LOCALITY_BY_LABEL, key=str.casefold)
+CITY_CHOICES = sorted(
+    {city for city, _ in LOCALITY_BY_LABEL.values()},
+    key=str.casefold,
+)
+LOCALITY_CHOICES_BY_CITY = {
+    city: sorted(
+        {
+            locality
+            for selected_city, locality in LOCALITY_BY_LABEL.values()
+            if selected_city == city
+        },
+        key=str.casefold,
+    )
+    for city in CITY_CHOICES
+}
+DEFAULT_CITY = CITY_CHOICES[0] if CITY_CHOICES else None
+DEFAULT_LOCALITIES = (
+    LOCALITY_CHOICES_BY_CITY[DEFAULT_CITY] if DEFAULT_CITY is not None else []
+)
+DEFAULT_AREA = DEFAULT_LOCALITIES[0] if DEFAULT_LOCALITIES else None
 UPLOADS.mkdir(exist_ok=True)
 REPORTS.mkdir(exist_ok=True)
 DB_PATH.parent.mkdir(exist_ok=True)
@@ -187,6 +205,25 @@ def get_locality_benchmarks(selection: str | None) -> dict[str, Any] | None:
         "sample_data_warning": SAMPLE_DATA_WARNING,
         "rates": rates,
     }
+
+
+def update_locality_choices(city):
+    localities = LOCALITY_CHOICES_BY_CITY.get(city, [])
+    return gr.update(
+        choices=localities,
+        value=localities[0] if localities else None,
+    )
+
+
+def locality_selection_from_values(city, area):
+    if not city and not area:
+        return None
+    if not city or not area:
+        raise gr.Error("Select both a city and an area/locality.")
+    selection = f"{area}, {city}"
+    if LOCALITY_BY_LABEL.get(selection) != (city, area):
+        raise gr.Error("Select an area/locality listed for the selected city.")
+    return selection
 
 
 def _assessment_method(finding: dict) -> str:
@@ -310,7 +347,7 @@ def _photo_upload_result_markdown(observation: dict | None, error: str | None) -
     if not observation or observation.get("mode") != "llm_analyzed":
         message = "Automated image comparison was not completed."
         if error:
-            message += f"\n\n> Photo analysis failed: {error}"
+            message += f"\n\n> Photo analysis failed: {html.escape(error)}"
         return message
 
     lines = ["**Vision-model comparison completed.**"]
@@ -343,6 +380,58 @@ def safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", Path(name).name)[:120] or "upload"
 
 
+def _normalize_case_dates(move_in, move_out):
+    def normalize(value, label):
+        if value is None or value == "":
+            return None
+        if isinstance(value, datetime):
+            return value.date().isoformat()
+        if isinstance(value, date):
+            return value.isoformat()
+        try:
+            parsed = datetime.strptime(str(value), "%Y-%m-%d")
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{label} must be a valid date in YYYY-MM-DD format."
+            ) from exc
+        normalized = parsed.strftime("%Y-%m-%d")
+        if normalized != str(value):
+            raise ValueError(
+                f"{label} must be a valid date in YYYY-MM-DD format."
+            )
+        return normalized
+
+    move_in_date = normalize(move_in, "Move-in date")
+    move_out_date = normalize(move_out, "Move-out date")
+    if move_in_date and move_out_date and move_out_date < move_in_date:
+        raise ValueError("Move-out date cannot be earlier than move-in date.")
+    return move_in_date, move_out_date
+
+
+def validate_case_dates(move_in, move_out):
+    try:
+        _normalize_case_dates(move_in, move_out)
+    except ValueError as exc:
+        return gr.update(value=str(exc), visible=True)
+    return gr.update(value="", visible=False)
+
+
+def handle_move_in_change(move_in, move_out):
+    try:
+        normalized_move_in, _ = _normalize_case_dates(move_in, None)
+        normalized_move_out = _normalize_case_dates(None, move_out)[1]
+    except ValueError as exc:
+        return gr.update(), gr.update(value=str(exc), visible=True)
+
+    if (
+        normalized_move_in
+        and normalized_move_out
+        and normalized_move_out < normalized_move_in
+    ):
+        return gr.update(value=None), gr.update(value="", visible=False)
+    return gr.update(), gr.update(value="", visible=False)
+
+
 def save_upload(src: str, case_id: str) -> str:
     src_path = Path(src)
     destination = UPLOADS / case_id
@@ -355,6 +444,10 @@ def save_upload(src: str, case_id: str) -> str:
 def create_case(name, deposit, claimed, proposed, move_in, move_out):
     if not name or not str(name).strip():
         raise gr.Error("Please enter a case or property name.")
+    try:
+        move_in, move_out = _normalize_case_dates(move_in, move_out)
+    except ValueError as exc:
+        raise gr.Error(str(exc)) from exc
     try:
         deposit = float(deposit)
         claimed = float(claimed)
@@ -382,23 +475,34 @@ def create_case(name, deposit, claimed, proposed, move_in, move_out):
         f"{'⚠️ The proposed refund differs from the calculated refund.' if proposed is not None and abs(proposed-calculated) > 0.01 else 'Financial arithmetic checked.'}\n\n"
         f"{ai_status_markdown()}"
     )
-    return case_id, msg, case_id, gr.update(visible=True)
+    return case_id, msg
 
 
 def ai_status_markdown() -> str:
-    """Show whether AI-assisted analysis is available without exposing configuration."""
+    """Show AI availability and required key names without exposing credentials."""
     if llm_is_configured():
         return "**AI status:** AI-assisted analysis is available."
-    return "**AI status:** AI-assisted analysis is unavailable; rules-based assessment remains available."
+    return (
+        "**AI status:** AI-assisted analysis is unavailable. "
+        + html.escape(get_configuration_error())
+        + " rules-based assessment remains available."
+    )
 
 
-def upload_documents(case_id, files, category):
+def upload_documents(case_id, primary_file, additional_files, additional_category):
     if not case_id:
         raise gr.Error("Create a case first.")
-    if not files:
-        return "No files selected.", refresh_deductions(case_id)
+    if not primary_file:
+        raise gr.Error("Upload the primary lease/agreement document.")
+
+    files = [(primary_file, "Rental agreement")]
+    if additional_files:
+        if not isinstance(additional_files, (list, tuple)):
+            additional_files = [additional_files]
+        files.extend((item, additional_category) for item in additional_files)
+
     results = []
-    for item in files:
+    for item, category in files:
         src = item if isinstance(item, str) else getattr(item, "name", None)
         if not src or not os.path.isfile(src):
             continue
@@ -553,254 +657,83 @@ def _auto_link_case_evidence(case_id):
                 )
 
 
-def prefill_benchmark_deduction(case_id, deduction_choice):
-    deduction_id = _choice_id(deduction_choice)
-    if not case_id or not deduction_id:
-        return gr.update(), None
-    with db() as con:
-        row = con.execute(
-            "SELECT category,description,amount FROM deductions WHERE id=? AND case_id=?",
-            (deduction_id, case_id),
-        ).fetchone()
-    if not row:
-            return gr.update(), None
-    categories = list(dict.fromkeys([
-        "Cleaning", "Electrical Repairs", "Furniture / Carpentry",
-        "Painting / Repainting", "Plumbing", row["category"],
-    ]))
-    return (
-        gr.update(choices=categories, value=row["category"]),
-        row["amount"],
-    )
+REPAIR_RATE_CATEGORY_BY_DEDUCTION = {
+    "painting / repainting": "Painting / Repainting",
+    "cleaning": "Cleaning",
+    "furniture damage": "Furniture / Carpentry",
+    "electrical repairs": "Electrical Repairs",
+    "plumbing": "Plumbing",
+}
 
 
-def _benchmark_deterministic_explanation(result):
-    if result["status"] == "no_match":
-        return result["explanation"]
-    amount = money(result["difference"], "INR")
-    percent = (
-        f" ({result['difference_percent']:.1f}%)"
-        if result.get("difference_percent") is not None and result["position"] != "within"
-        else ""
-    )
-    if result["position"] == "above":
-        return f"The claim is above the matched sample range by {amount}{percent}."
-    if result["position"] == "below":
-        return f"The claim is below the matched sample range by {amount}{percent}."
-    return "The claim falls within the matched sample range; this is not a finding that the price is fair or legally recoverable."
-
-
-def _benchmark_error_html(message):
-    return (
-        '<div class="dp-price"><div class="dp-alert"><strong>Could not compare repair rates</strong><br>'
-        + html.escape(str(message))
-        + "</div></div>"
-    )
-
-
-def render_repair_benchmark(result):
-    styles = """
-    <style>
-      .dp-price{font-family:Arial,sans-serif;color:#172554;padding:4px 0 18px}
-      .dp-price .dp-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:14px 0}
-      .dp-price .dp-card{background:#f8fafc;border:1px solid #dbe4ef;border-radius:12px;padding:14px}
-      .dp-price .dp-card small,.dp-price .dp-muted{color:#64748b}
-      .dp-price .dp-value{font-size:1.35rem;font-weight:700;margin-top:5px}
-      .dp-price .dp-alert{background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:14px;color:#7c2d12}
-      .dp-price .dp-good{background:#ecfdf5;border:1px solid #a7f3d0;border-radius:10px;padding:14px}
-      .dp-price .dp-chart{width:100%;height:auto;max-height:185px}
-      .dp-price table{width:100%;border-collapse:collapse;margin:10px 0;font-size:.88rem}
-      .dp-price th,.dp-price td{border:1px solid #dbe4ef;text-align:left;padding:8px;vertical-align:top}
-      .dp-price th{background:#eff6ff}
-      .dp-price h3{margin:20px 0 8px}
-      @media(max-width:600px){.dp-price table{font-size:.76rem}.dp-price th,.dp-price td{padding:5px}}
-    </style>
-    """
-    if result["status"] == "no_match":
-        return styles + (
-            '<div class="dp-price"><h2>Repair Price Intelligence</h2>'
-            '<div class="dp-alert">' + html.escape(result["explanation"]) + "</div>"
-            '<p class="dp-muted">' + html.escape(result["sample_data_warning"]) + "</p></div>"
-        )
-
-    low, high = result["lower"], result["upper"]
-    claim = result["claimed_amount"]
-    difference = result["difference"]
-    variance = (
-        f"{result['difference_percent']:.1f}%"
-        if result["position"] != "within" and result.get("difference_percent") is not None
-        else ("Within range" if result["position"] == "within" else "Not available")
-    )
-    max_axis = max(high, claim, 1) * 1.12
-    chart_left, chart_right = 75, 755
-    x = lambda value: chart_left + value / max_axis * (chart_right - chart_left)
-    chart = (
-        '<svg class="dp-chart" viewBox="0 0 820 150" role="img" aria-label="Claim compared with sample repair-rate range">'
-        '<text x="75" y="19" fill="#475569" font-size="13">Claim compared with sample range (INR)</text>'
-        '<line x1="75" y1="76" x2="755" y2="76" stroke="#cbd5e1" stroke-width="5"/>'
-        f'<line x1="{x(low):.1f}" y1="76" x2="{x(high):.1f}" y2="76" stroke="#2563eb" stroke-width="18" stroke-linecap="round"/>'
-        f'<text x="{x(low):.1f}" y="112" text-anchor="middle" fill="#334155" font-size="12">{html.escape(money(low))}</text>'
-        f'<text x="{x(high):.1f}" y="112" text-anchor="middle" fill="#334155" font-size="12">{html.escape(money(high))}</text>'
-        f'<circle cx="{x(claim):.1f}" cy="76" r="9" fill="#e11d48" stroke="white" stroke-width="3"/>'
-        f'<text x="{x(claim):.1f}" y="48" text-anchor="middle" fill="#9f1239" font-size="12">Claim {html.escape(money(claim))}</text>'
-        '<text x="75" y="137" fill="#64748b" font-size="11">₹0</text>'
-        f'<text x="755" y="137" text-anchor="end" fill="#64748b" font-size="11">{html.escape(money(max_axis))}</text>'
-        "</svg>"
-    )
-    cards = (
-        f'<div class="dp-grid"><div class="dp-card"><small>Landlord claim</small><div class="dp-value">{html.escape(money(claim))}</div></div>'
-        f'<div class="dp-card"><small>Matched sample range</small><div class="dp-value">{html.escape(money(low))} – {html.escape(money(high))}</div></div>'
-        f'<div class="dp-card"><small>Difference from nearest boundary</small><div class="dp-value">{html.escape(money(difference))}</div></div>'
-        f'<div class="dp-card"><small>Position</small><div class="dp-value">{html.escape(result["position"].replace("_", " ").title())}</div><small>{html.escape(variance)}</small></div></div>'
-    )
-    rows = []
-    for row in result["matched_records"]:
-        rows.append(
-            "<tr>"
-            f"<td>{html.escape(row['city'])}<br>{html.escape(row['locality'])}</td>"
-            f"<td>{html.escape(row['category'])}</td>"
-            f"<td>{html.escape(money(row['minimum']))} – {html.escape(money(row['maximum']))}</td>"
-            "</tr>"
-        )
-    quality = result.get("dataset_quality") or {}
-    issue_note = ""
-    if quality.get("issues") or quality.get("duplicate_count"):
-        issue_note = (
-            f"<p class='dp-muted'>Data quality: {len(quality.get('issues', []))} invalid row(s) skipped; "
-            f"{quality.get('duplicate_count', 0)} duplicate row(s) removed.</p>"
-        )
-    dataset_note = (
-        f"<p class='dp-muted'>Dataset: {quality.get('valid_row_count', 'unknown')} usable sample row(s) "
-        f"across the source file; {result['record_count']} matched row(s) used for this calculation.</p>"
-    )
-    comparison = (
-        '<div class="dp-good"><strong>Comparison level:</strong> '
-        + html.escape(result["match_description"])
-        + f". {result['record_count']} sample record(s) included.</div>"
-    )
-    explanation_mode = result.get("explanation_mode", "deterministic")
-    if explanation_mode == "hosted_model":
-        explanation = (
-            '<p><strong>Optional hosted-model explanation (does not change the calculation):</strong> '
-            + html.escape(result["llm_explanation"])
-            + "</p>"
-        )
-    else:
-        explanation = (
-            '<p><strong>Deterministic explanation:</strong> '
-            + html.escape(result.get("deterministic_explanation", ""))
-            + "</p>"
-        )
-        if result.get("llm_error"):
-            explanation += (
-                '<p class="dp-muted">Hosted-model explanation was not used: '
-                + html.escape(result["llm_error"])
-                + "</p>"
-            )
-    attach_note = result.get("report_attachment_note")
-    if attach_note:
-        explanation += '<p class="dp-muted">' + html.escape(attach_note) + "</p>"
-    return (
-        styles + '<div class="dp-price"><h2>Repair Price Intelligence</h2>'
-        + comparison + cards + chart + explanation
-        + "<p><strong>Matching method:</strong> " + html.escape(result["match_description"]) + ".</p>"
-        + "<p>" + html.escape(result["calculation"]) + "</p>"
-        + "<p class='dp-muted'>" + html.escape(result["sample_data_warning"]) + "</p>"
-        + dataset_note + issue_note
-        + "<h3>Matched sample records</h3><div style='overflow-x:auto'><table><thead><tr>"
-        + "<th>City / locality</th><th>Category</th><th>Listed range (INR)</th>"
-        + "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div></div>"
-    )
-
-
-def run_repair_price_comparison(
-    case_id, deduction_choice, category, claimed_amount, city, locality, ask_hosted_model
+def _automatic_repair_price_benchmark(
+    deduction, locality_benchmarks, repair_rate_data, repair_rate_error, currency,
 ):
+    city = locality_benchmarks["city"]
+    locality = locality_benchmarks["locality"]
+    category = REPAIR_RATE_CATEGORY_BY_DEDUCTION.get(
+        str(deduction["category"]).strip().casefold()
+    )
+    benchmark = {
+        "city": city,
+        "locality": locality,
+        "area": locality,
+        "damage_cause": deduction["description"],
+        "source_dataset": DATASET_NAME,
+        "sample_data_warning": SAMPLE_DATA_WARNING,
+        "matched_records": [],
+        "record_count": 0,
+    }
+    if currency != "INR":
+        return {
+            **benchmark,
+            "status": "unavailable",
+            "explanation": "Repair-rate benchmarks are available only for INR claims.",
+        }
+    if not category:
+        return {
+            **benchmark,
+            "status": "no_match",
+            "category": deduction["category"],
+            "explanation": (
+                f"No sample-rate category is mapped to the {deduction['category']} deduction type."
+            ),
+        }
+    if repair_rate_error:
+        return {
+            **benchmark,
+            "status": "unavailable",
+            "category": category,
+            "explanation": f"Repair-rate data could not be loaded: {repair_rate_error}",
+        }
+
     try:
-        dataset = load_repair_rates()
         result = compare_repair_price(
-            dataset["records"],
+            repair_rate_data["records"],
             city=city,
             locality=locality,
             category=category,
-            claimed_amount=claimed_amount,
+            claimed_amount=deduction["amount"],
         )
-    except (RepairRateDataError, ValueError) as exc:
-        return _benchmark_error_html(str(exc))
-
-    result["dataset_quality"] = {
-        "valid_row_count": len(dataset["records"]),
-        "issues": dataset["issues"],
-        "duplicate_count": dataset["duplicate_count"],
+    except ValueError as exc:
+        return {
+            **benchmark,
+            "status": "unavailable",
+            "category": category,
+            "explanation": str(exc),
+        }
+    return {
+        **result,
+        "area": locality,
+        "damage_cause": deduction["description"],
+        "source_dataset": repair_rate_data["dataset_name"],
+        "sample_data_warning": SAMPLE_DATA_WARNING,
+        "dataset_quality": {
+            "valid_row_count": len(repair_rate_data["records"]),
+            "issues": repair_rate_data["issues"],
+            "duplicate_count": repair_rate_data["duplicate_count"],
+        },
     }
-    result["deterministic_explanation"] = _benchmark_deterministic_explanation(result)
-    result["explanation_mode"] = "deterministic"
-    deduction_id = _choice_id(deduction_choice)
-    if deduction_id:
-        if not case_id:
-            return _benchmark_error_html("Select an active case before attaching a comparison to a deduction.")
-        with db() as con:
-            selected_deduction = con.execute(
-                """SELECT d.description,d.amount,c.currency
-                   FROM deductions d JOIN cases c ON c.id=d.case_id
-                   WHERE d.id=? AND d.case_id=?""",
-                (deduction_id, case_id),
-            ).fetchone()
-        if not selected_deduction:
-            return _benchmark_error_html("The selected deduction is not part of the active case. Refresh the deduction list.")
-    if ask_hosted_model and result["status"] == "matched":
-        result["llm_explanation"] = explain_repair_benchmark_with_llm(result)
-        if result["llm_explanation"]:
-            result["explanation_mode"] = "hosted_model"
-        else:
-            result["llm_error"] = get_last_error() or "No valid hosted-model explanation was returned."
-
-    if deduction_id:
-        with db() as con:
-            deduction = con.execute(
-                """SELECT d.description,d.amount,c.currency
-                   FROM deductions d JOIN cases c ON c.id=d.case_id
-                   WHERE d.id=? AND d.case_id=?""",
-                (deduction_id, case_id),
-            ).fetchone()
-            if not deduction:
-                return _benchmark_error_html("The selected deduction is no longer available; refresh the deduction list.")
-            con.execute("DELETE FROM repair_benchmarks WHERE deduction_id=?", (deduction_id,))
-            amount_matches = abs(float(deduction["amount"]) - float(result["claimed_amount"])) < 0.01
-            if (result["status"] == "matched" and amount_matches
-                    and deduction["currency"] == "INR"):
-                con.execute(
-                    """INSERT INTO repair_benchmarks(
-                        deduction_id,case_id,deduction_description,deduction_amount,
-                        benchmark_json,created_at
-                    ) VALUES(?,?,?,?,?,?)
-                    ON CONFLICT(deduction_id) DO UPDATE SET
-                        case_id=excluded.case_id,
-                        deduction_description=excluded.deduction_description,
-                        deduction_amount=excluded.deduction_amount,
-                        benchmark_json=excluded.benchmark_json,
-                        created_at=excluded.created_at""",
-                    (
-                        deduction_id, case_id, deduction["description"], deduction["amount"],
-                        json.dumps(result, ensure_ascii=False),
-                        datetime.now().isoformat(timespec="seconds"),
-                    ),
-                )
-                result["report_attachment_note"] = (
-                    "Saved to this deduction. The next audit report will include it as a separate, "
-                    "non-classifying benchmark section."
-                )
-            elif deduction["currency"] != "INR":
-                result["report_attachment_note"] = "Not attached to the audit because the case currency is not INR."
-            elif not amount_matches:
-                result["report_attachment_note"] = (
-                    "Not attached to the audit because the comparison amount does not match the saved deduction amount."
-                )
-            else:
-                result["report_attachment_note"] = "No matched estimate was saved to the audit."
-    elif result["status"] == "matched":
-        result["report_attachment_note"] = "Dashboard-only comparison; select a deduction to include it in the next audit report."
-    return render_repair_benchmark(result)
 
 
 def _owned_id(con, table: str, item_id: str | None, case_id: str) -> str | None:
@@ -851,7 +784,7 @@ def remove_deduction(case_id, deduction_choice):
 
 def refresh_deductions(case_id):
     if not case_id:
-        return "Create or select a case first."
+        return "Create a case first."
     with db() as con:
         rows = con.execute("SELECT * FROM deductions WHERE case_id=? ORDER BY created_at", (case_id,)).fetchall()
         case = con.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
@@ -901,6 +834,23 @@ def run_audit(case_id, locality_selection=None):
         agreement_problem = "The uploaded rental agreement could not be extracted, so contract terms could not be checked."
     else:
         agreement_problem = None
+    repair_rate_data = None
+    repair_rate_error = None
+    if (
+        locality_benchmarks
+        and case["currency"] == "INR"
+        and any(
+            REPAIR_RATE_CATEGORY_BY_DEDUCTION.get(
+                str(deduction["category"]).strip().casefold()
+            )
+            for deduction in deductions
+        )
+    ):
+        try:
+            repair_rate_data = load_repair_rates()
+        except RepairRateDataError as exc:
+            repair_rate_error = str(exc)
+
     report_findings = []
     for row in deductions:
         deduction = dict(row)
@@ -967,14 +917,23 @@ def run_audit(case_id, locality_selection=None):
         assessment["description"] = deduction["description"]
         assessment["amount"] = deduction["amount"]
         assessment["source_note"] = "Only uploaded and successfully extracted evidence was considered."
-        benchmark_row = benchmarks.get(deduction["id"])
-        if (benchmark_row
-                and benchmark_row["deduction_description"] == deduction["description"]
-                and abs(float(benchmark_row["deduction_amount"]) - float(deduction["amount"])) < 0.01
-                and case["currency"] == "INR"):
-            benchmark = json.loads(benchmark_row["benchmark_json"])
-            if benchmark.get("status") == "matched":
-                assessment["repair_price_benchmark"] = benchmark
+        if locality_benchmarks:
+            assessment["repair_price_benchmark"] = _automatic_repair_price_benchmark(
+                deduction,
+                locality_benchmarks,
+                repair_rate_data,
+                repair_rate_error,
+                case["currency"],
+            )
+        else:
+            benchmark_row = benchmarks.get(deduction["id"])
+            if (benchmark_row
+                    and benchmark_row["deduction_description"] == deduction["description"]
+                    and abs(float(benchmark_row["deduction_amount"]) - float(deduction["amount"])) < 0.01
+                    and case["currency"] == "INR"):
+                benchmark = json.loads(benchmark_row["benchmark_json"])
+                if benchmark.get("status") == "matched":
+                    assessment["repair_price_benchmark"] = benchmark
         report_findings.append(assessment)
         with db() as con:
             con.execute(
@@ -1059,26 +1018,46 @@ def run_audit(case_id, locality_selection=None):
             ])
         benchmark = f.get("repair_price_benchmark")
         if benchmark:
-            lines.extend([
-                "",
-                "### Repair-price benchmark — context only",
-                f"- Comparison: {benchmark.get('match_description', 'Comparable sample-rate records')} "
-                f"for {benchmark.get('category', 'the selected category')} in "
-                f"{benchmark.get('city', 'the selected city')}"
-                + (f", {benchmark['locality']}" if benchmark.get("locality") else "")
-                + f"; {benchmark.get('record_count', 0)} sample record(s).",
-                f"- Sample range: {money(benchmark['lower'])}–{money(benchmark['upper'])}.",
-                f"- Claim position: {benchmark.get('position', 'not stated')}; difference from nearest boundary: "
-                f"{money(benchmark.get('difference', 0))}."
-                + (f" ({benchmark['difference_percent']:.1f}%)"
-                   if benchmark.get("difference_percent") is not None and benchmark.get("position") != "within"
-                   else ""),
-                f"- Source: {benchmark.get('source_dataset', DATASET_NAME)}. "
-                f"{benchmark.get('sample_data_warning', 'Sample data; not verified quotations.')}",
-            ])
-            if benchmark.get("llm_explanation"):
+            lines.extend(["", "### Repair-price benchmark — context only"])
+            lines.append(
+                f"- Damage cause: {html.escape(str(benchmark.get('damage_cause', f['description'])))}."
+            )
+            if benchmark.get("area"):
                 lines.append(
-                    f"- Optional hosted-model explanation (does not change the calculation): {benchmark['llm_explanation']}"
+                    f"- Area: {html.escape(str(benchmark['area']))}, "
+                    f"{html.escape(str(benchmark.get('city', '')))}."
+                )
+            if benchmark.get("status") == "matched":
+                lines.extend([
+                    f"- Comparison: {html.escape(str(benchmark.get('match_description', 'Comparable sample-rate records')))} "
+                    f"for {html.escape(str(benchmark.get('category', 'the selected category')))}; "
+                    f"{benchmark.get('record_count', 0)} sample record(s).",
+                    f"- Claimed amount: {money(benchmark['claimed_amount'])}.",
+                    f"- Sample range: {money(benchmark['lower'])}–{money(benchmark['upper'])}.",
+                    f"- Claim position: {benchmark.get('position', 'not stated')}; difference from nearest boundary: "
+                    f"{money(benchmark.get('difference', 0))}."
+                    + (f" ({benchmark['difference_percent']:.1f}%)"
+                       if benchmark.get("difference_percent") is not None and benchmark.get("position") != "within"
+                       else ""),
+                    "- Matched sample rates:",
+                ])
+                for sample in benchmark.get("matched_records", [])[:8]:
+                    lines.append(
+                        f"  - {html.escape(str(sample['city']))}, "
+                        f"{html.escape(str(sample['locality']))}: "
+                        f"{html.escape(str(sample['category']))} — "
+                        f"{money(sample['minimum'])}–{money(sample['maximum'])}."
+                    )
+                lines.append(
+                    f"- Source: {benchmark.get('source_dataset', DATASET_NAME)}. "
+                    f"{benchmark.get('sample_data_warning', 'Sample data; not verified quotations.')}"
+                )
+            else:
+                lines.append(
+                    "- Cost comparison unavailable: "
+                    + html.escape(str(benchmark.get(
+                        "explanation", "No comparable sample-rate data was available."
+                    )))
                 )
         locality_benchmark = f.get("locality_benchmark")
         if locality_benchmark:
@@ -1161,7 +1140,7 @@ def upload_photo_pair(case_id, item_name, move_in_file, move_out_file):
         else:
             analysis_error = get_last_error() or "The hosted vision model returned no usable result."
     else:
-        analysis_error = get_last_error() or "Hosted AI is not configured; check the selected provider's API key and LLM_PROVIDER in .env."
+        analysis_error = get_last_error() or get_configuration_error()
     if not observation:
         observation = {
             "observation": "Photographs uploaded. Vision-language model analysis is not configured or did not return a result.",
@@ -1185,48 +1164,6 @@ def upload_photo_pair(case_id, item_name, move_in_file, move_out_file):
     )
     return detail, refresh_deductions(case_id)
 
-
-def analyze_agreement(case_id):
-    if not case_id:
-        raise gr.Error("Create a case first.")
-    docs = documents_for_case(case_id)
-    agreements = [d for d in docs if d["category"] == "Rental agreement" and d["extracted_text"]]
-    if not agreements:
-        return "No readable rental agreement PDF found for this case."
-    if not llm_is_configured():
-        return "Hosted language models are not configured. Add an API key for the selected provider to the local `.env` file; the extracted agreement text remains available for rules-based clause retrieval."
-    outputs = []
-    for d in agreements:
-        result = analyze_agreement_with_llm(
-            d["extracted_text"],
-            json.loads(d["page_text_json"] or "{}"),
-            d["filename"],
-        )
-        if result is None:
-            outputs.append(f"## {d['filename']}\n\nHosted analysis failed: {get_last_error() or 'No usable model response was returned.'}")
-        else:
-            outputs.append(f"## {d['filename']}\n\n```json\n{json.dumps(result, ensure_ascii=False, indent=2)}\n```")
-    return "\n\n".join(outputs)
-
-
-def prepare_local_draft(case_id):
-    if not case_id or _active_case_problem(case_id):
-        return "", gr.update(visible=False)
-    return case_id, gr.update(visible=True)
-
-
-def load_selected_case(case_id):
-    if not case_id or _active_case_problem(case_id):
-        return (
-            "",
-            refresh_deductions(None),
-            "The saved draft could not be found. Create a new case to continue.",
-        )
-    return (
-        case_id,
-        refresh_deductions(case_id),
-        f"Loaded case `{case_id}`.",
-    )
 
 def _workflow_visibility(active_step: int):
     if active_step not in range(1, 5):
@@ -1277,10 +1214,10 @@ def _enter_application():
 
 def _active_case_problem(case_id):
     if not case_id:
-        return "Create or select an audit case before continuing."
+        return "Create an audit case before continuing."
     with db() as con:
         if not con.execute("SELECT 1 FROM cases WHERE id=?", (case_id,)).fetchone():
-            return "The selected audit case could not be found. Create or select it again."
+            return "The audit case could not be found. Create it again."
     return None
 
 
@@ -1296,9 +1233,40 @@ def _continue_from_review(report_markdown):
     return _navigate_to_step(4, None, report_markdown)
 
 
-def _run_audit_for_workflow(case_id, locality_selection=None):
+def toggle_additional_documents(is_visible):
+    visible = not bool(is_visible)
+    button_label = (
+        "- Hide Optional Additional Documents"
+        if visible else "+ Add Optional Additional Documents"
+    )
+    return visible, gr.update(visible=visible), gr.update(value=button_label)
+
+
+def _run_audit_for_workflow(case_id, city=None, area=None):
+    locality_selection = locality_selection_from_values(city, area)
     markdown, pdf_path, deductions = run_audit(case_id, locality_selection)
     return markdown, markdown, pdf_path, deductions
+
+
+SCROLL_TO_TOP_JS = (
+    "(...args) => { window.scrollTo({ top: 0, behavior: 'smooth' }); return args; }"
+)
+SHOW_LOADING_JS = """(...args) => {
+    const overlay = document.getElementById("dp-loading-overlay");
+    if (overlay) {
+        overlay.classList.add("dp-loading-overlay-visible");
+        overlay.setAttribute("aria-hidden", "false");
+    }
+    return args;
+}"""
+HIDE_LOADING_JS = """(...args) => {
+    const overlay = document.getElementById("dp-loading-overlay");
+    if (overlay) {
+        overlay.classList.remove("dp-loading-overlay-visible");
+        overlay.setAttribute("aria-hidden", "true");
+    }
+    return args;
+}"""
 
 
 DESIGN_CSS = """
@@ -1446,6 +1414,8 @@ html, body, .gradio-container {
 .dp-action-row .dp-action-spacer { flex: 1; }
 .dp-action-row button { flex: 0 0 auto !important; width: auto !important; min-width: 150px; }
 .dp-upload-help { margin: 3px 0 15px; color: var(--dp-muted); font-size: 12px; line-height: 1.65; }
+.dp-date-validation { margin: 4px 0 8px; color: #b42318 !important; font-size: 13px; }
+.dp-date-validation .prose { color: #b42318 !important; }
 .dp-result-block { min-width: 0; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--dp-line); overflow-wrap: anywhere; color: var(--dp-ink); opacity: 1; }
 .dp-case-summary .prose .dp-case-id { display: inline-block; max-width: 100%; padding: 8px 11px; border: 1px solid var(--dp-line-strong); border-radius: 6px; background: #f8fafc; color: var(--dp-navy); font: 600 15px/1.4 "Segoe UI", Arial, sans-serif; overflow-wrap: anywhere; user-select: text; }
 .dp-document-upload .file-preview .file,
@@ -1514,6 +1484,47 @@ html, body, .gradio-container {
 APP_CSS = DESIGN_CSS + """
 footer { visibility: hidden !important; display: none !important; }
 .gradio-container .footer { display: none !important; }
+#dp-loading-overlay {
+  display: none !important;
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 9999 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  max-width: none !important;
+  margin: 0 !important;
+  padding: 24px !important;
+  align-items: center !important;
+  justify-content: center !important;
+  background: rgba(15, 23, 42, .48) !important;
+  backdrop-filter: blur(4px);
+  pointer-events: auto !important;
+}
+#dp-loading-overlay.dp-loading-overlay-visible { display: flex !important; }
+#dp-loading-overlay .dp-loading-overlay__content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  max-width: min(440px, 100%);
+  padding: 28px 34px;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #fff;
+  color: #1b2939;
+  text-align: center;
+  box-shadow: 0 16px 48px rgba(15, 23, 42, .2);
+}
+#dp-loading-overlay .dp-loading-overlay__content p { margin: 0; font-size: 15px; font-weight: 650; line-height: 1.5; }
+#dp-loading-overlay .dp-loading-spinner {
+  width: 44px;
+  height: 44px;
+  border: 4px solid #dbe5ef;
+  border-top-color: #2563eb;
+  border-radius: 50%;
+  animation: dp-loading-spin .8s linear infinite;
+}
+@keyframes dp-loading-spin { to { transform: rotate(360deg); } }
 """
 
 with gr.Blocks(
@@ -1578,31 +1589,54 @@ with gr.Blocks(
         with gr.Column(visible=True, elem_classes=["dp-workflow-panel"]) as case_step:
             gr.HTML(
                 '<h2 class="dp-section-title">1. Set up your audit case</h2>'
-                '<p class="dp-section-copy">Add the deposit details, then create a new case or resume the draft remembered by this browser.</p>'
+                '<p class="dp-section-copy">Add the deposit and property details, then create your audit case.</p>'
             )
-            with gr.Row(elem_classes=["dp-case-layout"]):
-                with gr.Column(scale=3, elem_classes=["dp-case-card"]):
-                    gr.HTML('<h3 class="dp-subsection">Property and deposit details</h3>')
-                    case_name = gr.Textbox(label="Case / property name", placeholder="e.g. My Apartment")
-                    with gr.Row():
-                        deposit = gr.Number(label="Security deposit (₹)", value=30000, minimum=0)
-                        claimed = gr.Number(label="Landlord-claimed deductions (₹)", value=12000, minimum=0)
-                    proposed = gr.Number(label="Proposed refund (₹, optional)", value=18000, minimum=0)
-                    with gr.Row():
-                        move_in = gr.Textbox(label="Move-in date (optional)", placeholder="YYYY-MM-DD")
-                        move_out = gr.Textbox(label="Move-out date (optional)", placeholder="YYYY-MM-DD")
-                    create_btn = gr.Button("Create audit case", variant="primary")
-                    active_case = gr.Textbox(label="Active case ID", interactive=False)
-                    browser_draft_id = gr.Textbox(visible=False)
-                    case_message = gr.Markdown(
-                        elem_classes=["dp-result-block", "dp-case-summary"]
+            with gr.Column(elem_classes=["dp-case-card"]):
+                gr.HTML('<h3 class="dp-subsection">Property and deposit details</h3>')
+                case_name = gr.Textbox(label="Case / property name", placeholder="e.g. My Apartment")
+                with gr.Row():
+                    deposit = gr.Number(label="Security deposit (₹)", value=30000, minimum=0)
+                    claimed = gr.Number(label="Landlord-claimed deductions (₹)", value=12000, minimum=0)
+                proposed = gr.Number(label="Proposed refund (₹, optional)", value=18000, minimum=0)
+                with gr.Row():
+                    move_in = gr.DateTime(
+                        label="Move-In Date",
+                        include_time=False,
+                        type="string",
+                        info="Select a date or leave blank.",
                     )
-                with gr.Column(scale=2, elem_classes=["dp-case-card"]):
-                    resume_btn = gr.Button("Resume", visible=False)
-                    load_result = gr.Markdown(elem_classes=["dp-result-block"])
-                    gr.HTML(
-                        '<div class="dp-inline-note">This browser remembers the active case ID; case details and uploads remain stored by this application.</div>'
+                    move_out = gr.DateTime(
+                        label="Move-Out Date",
+                        include_time=False,
+                        type="string",
+                        info="Select a date or leave blank.",
                     )
+                case_date_validation = gr.Markdown(
+                    visible=False,
+                    elem_classes=["dp-date-validation"],
+                )
+                with gr.Row():
+                    city_dropdown = gr.Dropdown(
+                        choices=CITY_CHOICES,
+                        value=DEFAULT_CITY,
+                        label="City",
+                        filterable=True,
+                    )
+                    area_dropdown = gr.Dropdown(
+                        choices=DEFAULT_LOCALITIES,
+                        value=DEFAULT_AREA,
+                        label="Area / Locality",
+                        filterable=True,
+                    )
+                gr.HTML(
+                    '<p class="dp-upload-help">The audit uses this locality for repair-price comparisons '
+                    'where eligible deductions have matching sample data.</p>'
+                )
+                create_btn = gr.Button("Create audit case", variant="primary")
+                active_case = gr.Textbox(label="Active case ID", interactive=False)
+                case_message = gr.Markdown(
+                    elem_classes=["dp-result-block", "dp-case-summary"]
+                )
             with gr.Row(elem_classes=["dp-action-row"]):
                 gr.HTML('<span class="dp-action-spacer"></span>')
                 case_continue = gr.Button("Continue to evidence", variant="primary")
@@ -1610,151 +1644,101 @@ with gr.Blocks(
         with gr.Column(visible=False, elem_classes=["dp-workflow-panel"]) as evidence_step:
             gr.HTML(
                 '<h2 class="dp-section-title">2. Add the supporting evidence</h2>'
-                '<p class="dp-section-copy">Upload readable documents, select a locality for sample price comparisons, compare a matched photo pair, and enter itemised claims.</p>'
+                '<p class="dp-section-copy">Add the lease, optional supporting documents, move-in and move-out photos, and itemised claims.</p>'
             )
             gr.HTML('<h3 class="dp-subsection">Rental documents</h3>')
             gr.HTML(
                 '<p class="dp-upload-help">Text-based PDFs are extracted locally. Scanned PDFs are not OCR-processed. '
                 'The interface reports extraction and model status after processing; selecting a file alone does not mean it was analysed.</p>'
             )
-            upload_category = gr.Dropdown(
-                ["Rental agreement", "Invoice / receipt", "Deduction statement", "Inspection report", "Other document"],
-                value="Rental agreement", label="Document category",
-            )
             gr.HTML(
                 '<div class="dp-document-intro"><svg class="dp-upload-icon" viewBox="0 0 24 24" '
                 'fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">'
                 '<path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/>'
-                '</svg><span>Upload supporting documents<small>Drag files here or browse. PDFs and images are accepted; only text-based PDFs are extracted.</small></span></div>'
+                '</svg><span>Upload the primary lease or agreement<small>One required file. PDFs and images are accepted; only text-based PDFs are extracted.</small></span></div>'
             )
             document_files = gr.File(
-                label="Choose agreement, invoice, deduction statement, or inspection PDF",
-                file_count="multiple", type="filepath", elem_classes=["dp-document-upload"],
+                label="Primary lease/agreement document",
+                file_count="single", type="filepath",
+                file_types=[".pdf", ".png", ".jpg", ".jpeg", ".webp"],
+                elem_classes=["dp-document-upload"],
             )
+            optional_documents_state = gr.State(False)
+            additional_documents_toggle = gr.Button("+ Add Optional Additional Documents")
+            with gr.Column(visible=False, elem_classes=["dp-optional-documents"]) as additional_documents_panel:
+                additional_document_category = gr.Dropdown(
+                    ["Invoice / receipt", "Deduction statement", "Inspection report", "Other document"],
+                    value="Other document", label="Additional document category",
+                )
+                additional_document_files = gr.File(
+                    label="Optional additional documents",
+                    file_count="multiple", type="filepath",
+                    file_types=[".pdf", ".png", ".jpg", ".jpeg", ".webp"],
+                    elem_classes=["dp-document-upload"],
+                )
             with gr.Row():
-                upload_btn = gr.Button("Upload and extract", variant="primary")
-                llm_extract_btn = gr.Button("Review agreement details with hosted model")
+                upload_btn = gr.Button("Upload documents and extract", variant="primary")
             upload_output = gr.Markdown(elem_classes=["dp-result-block"])
-            locality_dropdown = gr.Dropdown(
-                choices=LOCALITY_CHOICES,
-                value=None,
-                label="Select Locality / Area",
-            )
-            gr.HTML(
-                '<p class="dp-upload-help">When selected, locality-specific painting, cleaning, plumbing, '
-                'electrical, and carpentry sample ranges are compared with relevant claimed deductions. '
-                'These sample rates provide context only and do not determine the evidence classification.</p>'
-            )
-            llm_extract_output = gr.Markdown(elem_classes=["dp-result-block"])
-            llm_extract_btn.click(
-                analyze_agreement, [active_case], [llm_extract_output],
-                show_progress="full",
-            )
 
-            with gr.Accordion("Itemised deductions", open=True):
-                gr.HTML('<p class="dp-upload-help">Enter each landlord claim separately. Uploaded invoices and photo pairs are matched to deductions using the description and evidence keywords; uncertain matches are left unlinked.</p>')
-                with gr.Row():
-                    deduction_category = gr.Dropdown(
-                        ["Painting / repainting", "Cleaning", "Furniture damage", "Appliance damage",
-                         "Plumbing", "Electrical repairs", "Structural damage", "Other"],
-                        value="Other", label="Deduction category",
+            gr.HTML('<h3 class="dp-subsection">Move-in and move-out photos</h3>')
+            gr.HTML('<p class="dp-upload-help">Provide both photos of the same room or item. The vision model compares only the images provided and reports when it cannot analyse them.</p>')
+            photo_item = gr.Textbox(label="Room or item", placeholder="e.g. Living room wall")
+            with gr.Row(elem_classes=["dp-photo-grid"]):
+                with gr.Column(elem_classes=["dp-photo-card"]):
+                    gr.HTML(
+                        '<div class="dp-photo-instructions"><svg class="dp-upload-icon" viewBox="0 0 24 24" '
+                        'fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">'
+                        '<path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/>'
+                        '</svg><span>Upload move-in photo<small>Drag an image here or browse files</small></span></div>'
                     )
-                    deduction_amount = gr.Number(label="Claimed amount (₹)", value=1000, minimum=0)
-                deduction_description = gr.Textbox(label="Deduction description", placeholder="e.g. Repainting the living room")
-                add_deduction_btn = gr.Button("Add deduction", variant="primary")
-                deduction_output = gr.Markdown(elem_classes=["dp-result-block"])
-                deductions_view = gr.Markdown(elem_classes=["dp-result-block"])
-                add_deduction_btn.click(
-                    add_deduction,
-                    [active_case, deduction_category, deduction_description, deduction_amount],
-                    [deduction_output, deductions_view],
-                )
-
-            with gr.Accordion("Move-in and move-out photographs", open=True):
-                gr.HTML('<p class="dp-upload-help">Choose photos of the same room or item. The vision model compares only the images provided and reports when it cannot analyse them.</p>')
-                photo_item = gr.Textbox(label="Room or item", placeholder="e.g. Living room wall")
-                with gr.Row(elem_classes=["dp-photo-grid"]):
-                    with gr.Column(elem_classes=["dp-photo-card"]):
-                        gr.HTML(
-                            '<div class="dp-photo-instructions"><svg class="dp-upload-icon" viewBox="0 0 24 24" '
-                            'fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">'
-                            '<path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/>'
-                            '</svg><span>Upload move-in photo<small>Drag an image here or browse files</small></span></div>'
-                        )
-                        photo_in = gr.File(
-                            label="Choose move-in photo", type="filepath",
-                            file_types=[".png", ".jpg", ".jpeg", ".webp"],
-                            elem_classes=["dp-photo-upload"],
-                        )
-                        photo_in_preview = gr.Image(
-                            label="Selected move-in preview", interactive=False,
-                            visible=False, height=180, elem_classes=["dp-photo-preview"],
-                        )
-                    with gr.Column(elem_classes=["dp-photo-card"]):
-                        gr.HTML(
-                            '<div class="dp-photo-instructions"><svg class="dp-upload-icon" viewBox="0 0 24 24" '
-                            'fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">'
-                            '<path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/>'
-                            '</svg><span>Upload move-out photo<small>Drag an image here or browse files</small></span></div>'
-                        )
-                        photo_out = gr.File(
-                            label="Choose move-out photo", type="filepath",
-                            file_types=[".png", ".jpg", ".jpeg", ".webp"],
-                            elem_classes=["dp-photo-upload"],
-                        )
-                        photo_out_preview = gr.Image(
-                            label="Selected move-out preview", interactive=False,
-                            visible=False, height=180, elem_classes=["dp-photo-preview"],
-                        )
-                photo_btn = gr.Button("Save and compare photo pair", variant="primary")
-                photo_output = gr.Markdown(elem_classes=["dp-result-block"])
-
-            with gr.Accordion("Repair Price Intelligence (optional)", open=False):
-                gr.HTML(
-                    '<p class="dp-upload-help">Compare the selected city, locality, and category with the 10-metro sample ranges. '
-                    'Leave locality blank for a city-wide range aggregated across its listed localities. '
-                    'This is contextual only, not a finding about legal responsibility; a saved comparison never changes the audit classification.</p>'
-                )
-                benchmark_deduction = gr.Dropdown(
-                    label="Attach to a saved deduction (optional)", choices=["None"], value="None",
-                )
-                with gr.Row():
-                    refresh_benchmark_deductions = gr.Button("Refresh saved deductions")
-                    benchmark_category = gr.Dropdown(
-                        ["Cleaning", "Electrical Repairs", "Furniture / Carpentry",
-                         "Painting / Repainting", "Plumbing"],
-                        value="Painting / Repainting", label="Repair category",
+                    photo_in = gr.File(
+                        label="Choose move-in photo", type="filepath", file_count="single",
+                        file_types=[".png", ".jpg", ".jpeg", ".webp"],
+                        elem_classes=["dp-photo-upload"],
                     )
-                benchmark_amount = gr.Number(label="Claimed amount (₹)", minimum=0)
-                with gr.Row():
-                    benchmark_city = gr.Textbox(label="City", placeholder="e.g. Bengaluru")
-                    benchmark_locality = gr.Textbox(label="Locality (optional)", placeholder="e.g. HSR Layout")
-                benchmark_ask_hosted_model = gr.Checkbox(
-                    label="Ask the configured hosted model for an optional explanation (uses API quota; malformed replies may retry once)",
-                    value=False,
+                    photo_in_preview = gr.Image(
+                        label="Selected move-in preview", interactive=False,
+                        visible=False, height=180, elem_classes=["dp-photo-preview"],
+                    )
+                with gr.Column(elem_classes=["dp-photo-card"]):
+                    gr.HTML(
+                        '<div class="dp-photo-instructions"><svg class="dp-upload-icon" viewBox="0 0 24 24" '
+                        'fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">'
+                        '<path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 15v4a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-4"/>'
+                        '</svg><span>Upload move-out photo<small>Drag an image here or browse files</small></span></div>'
+                    )
+                    photo_out = gr.File(
+                        label="Choose move-out photo", type="filepath", file_count="single",
+                        file_types=[".png", ".jpg", ".jpeg", ".webp"],
+                        elem_classes=["dp-photo-upload"],
+                    )
+                    photo_out_preview = gr.Image(
+                        label="Selected move-out preview", interactive=False,
+                        visible=False, height=180, elem_classes=["dp-photo-preview"],
+                    )
+            photo_btn = gr.Button("Save and compare photo pair", variant="primary")
+            photo_output = gr.Markdown(elem_classes=["dp-result-block"])
+
+            gr.HTML('<h3 class="dp-subsection">Itemised deductions</h3>')
+            gr.HTML('<p class="dp-upload-help">Enter each landlord claim separately. Uploaded invoices and photo pairs are matched to deductions using the description and evidence keywords; uncertain matches are left unlinked.</p>')
+            with gr.Row():
+                deduction_category = gr.Dropdown(
+                    ["Painting / repainting", "Cleaning", "Furniture damage", "Appliance damage",
+                     "Plumbing", "Electrical repairs", "Structural damage", "Other"],
+                    value="Other", label="Deduction category",
                 )
-                benchmark_compare_btn = gr.Button("Compare with sample rates", variant="primary")
-                benchmark_output = gr.HTML()
-                refresh_benchmark_deductions.click(
-                    lambda active: gr.update(choices=["None"] + deduction_choices(active), value="None"),
-                    [active_case], [benchmark_deduction],
-                )
-                benchmark_deduction.change(
-                    prefill_benchmark_deduction,
-                    [active_case, benchmark_deduction],
-                    [benchmark_category, benchmark_amount],
-                )
-                benchmark_compare_btn.click(
-                    run_repair_price_comparison,
-                    [
-                        active_case, benchmark_deduction, benchmark_category, benchmark_amount,
-                        benchmark_city, benchmark_locality, benchmark_ask_hosted_model,
-                    ],
-                    [benchmark_output], show_progress="full",
-                )
+                deduction_amount = gr.Number(label="Claimed amount (₹)", value=1000, minimum=0)
+            deduction_description = gr.Textbox(label="Deduction description", placeholder="e.g. Repainting the living room")
+            add_deduction_btn = gr.Button("Add deduction", variant="primary")
+            deduction_output = gr.Markdown(elem_classes=["dp-result-block"])
+            deductions_view = gr.Markdown(elem_classes=["dp-result-block"])
+            add_deduction_btn.click(
+                add_deduction,
+                [active_case, deduction_category, deduction_description, deduction_amount],
+                [deduction_output, deductions_view],
+            )
 
             with gr.Row(elem_classes=["dp-action-row"]):
-                evidence_back = gr.Button("Back to case")
                 gr.HTML('<span class="dp-action-spacer"></span>')
                 evidence_continue = gr.Button("Continue to review", variant="primary")
 
@@ -1785,7 +1769,11 @@ with gr.Blocks(
                 "Your report will appear here after the audit completes.",
                 elem_classes=["dp-result-block", "dp-report"],
             )
-            report_file = gr.File(label="Download the generated audit report PDF")
+            report_file = gr.DownloadButton(
+                label="Download Audit Report",
+                variant="primary",
+                elem_classes=["dp-download-button"]
+            )
             with gr.Row(elem_classes=["dp-action-row"]):
                 report_back = gr.Button("Back to findings")
                 gr.HTML('<span class="dp-action-spacer"></span>')
@@ -1796,6 +1784,16 @@ with gr.Blocks(
             'Local files and database records require appropriate privacy and retention controls.</p>'
         )
 
+    gr.HTML(
+        """
+        <div class="dp-loading-overlay__content" role="status" aria-live="assertive">
+          <div class="dp-loading-spinner" aria-hidden="true"></div>
+          <p>Analyzing evidence &amp; generating report... Please wait</p>
+        </div>
+        """,
+        elem_id="dp-loading-overlay",
+    )
+
     workflow_components = [
         case_step, evidence_step, review_step, report_step,
         step_case, step_evidence, step_findings, step_report, workflow_message,
@@ -1805,32 +1803,34 @@ with gr.Blocks(
         _enter_application,
         outputs=[welcome_screen, app_shell, *workflow_components],
         show_progress="hidden",
+        js=SCROLL_TO_TOP_JS,
     )
     case_continue.click(
         _continue_from_case, [active_case],
         workflow_components,
+        js=SCROLL_TO_TOP_JS,
     )
     evidence_continue.click(
         _continue_from_evidence,
         [active_case],
         workflow_components,
-    )
-    evidence_back.click(
-        lambda case_id: _navigate_to_step(1, case_id, None),
-        [active_case], workflow_components,
+        js=SCROLL_TO_TOP_JS,
     )
     review_back.click(
         lambda case_id: _navigate_to_step(2, case_id, None),
         [active_case], workflow_components,
+        js=SCROLL_TO_TOP_JS,
     )
     review_continue.click(
         _continue_from_review,
         [report_output],
         workflow_components,
+        js=SCROLL_TO_TOP_JS,
     )
     report_back.click(
         lambda case_id: _navigate_to_step(3, case_id, None),
         [active_case], workflow_components,
+        js=SCROLL_TO_TOP_JS,
     )
     for step_number, step_button in enumerate(
         (step_case, step_evidence, step_findings, step_report), start=1,
@@ -1840,39 +1840,47 @@ with gr.Blocks(
             [active_case, report_output],
             workflow_components,
             show_progress="hidden",
+            js=SCROLL_TO_TOP_JS,
         )
 
-    demo.load(
-        prepare_local_draft,
-        [browser_draft_id],
-        [browser_draft_id, resume_btn],
-        js=f"() => [window.localStorage.getItem('{ACTIVE_DRAFT_STORAGE_KEY}') || '']",
-        show_progress="hidden",
-    )
     create_btn.click(
         create_case, [case_name, deposit, claimed, proposed, move_in, move_out],
-        [active_case, case_message, browser_draft_id, resume_btn],
-    ).then(
-        fn=None,
-        inputs=[active_case],
-        outputs=[],
-        js=f"""(caseId) => {{
-            if (caseId) window.localStorage.setItem('{ACTIVE_DRAFT_STORAGE_KEY}', caseId);
-            return [];
-        }}""",
+        [active_case, case_message],
+    )
+    move_in.change(
+        handle_move_in_change,
+        [move_in, move_out],
+        [move_out, case_date_validation],
         show_progress="hidden",
     )
-    resume_btn.click(
-        load_selected_case, [browser_draft_id],
-        [active_case, deductions_view, load_result],
+    move_out.change(
+        validate_case_dates,
+        [move_in, move_out],
+        case_date_validation,
+        show_progress="hidden",
     )
-    upload_btn.click(
-        upload_documents, [active_case, document_files, upload_category],
-        [upload_output, deductions_view], show_progress="full",
+    additional_documents_toggle.click(
+        toggle_additional_documents,
+        [optional_documents_state],
+        [optional_documents_state, additional_documents_panel, additional_documents_toggle],
+        show_progress="hidden",
     )
-    photo_btn.click(
+    upload_event = upload_btn.click(
+        upload_documents,
+        [active_case, document_files, additional_document_files, additional_document_category],
+        [upload_output, deductions_view],
+        show_progress="full",
+        js=SHOW_LOADING_JS,
+    )
+    upload_event.then(
+        fn=None, inputs=[], outputs=[], js=HIDE_LOADING_JS, show_progress="hidden",
+    )
+    photo_event = photo_btn.click(
         upload_photo_pair, [active_case, photo_item, photo_in, photo_out],
-        [photo_output, deductions_view], show_progress="full",
+        [photo_output, deductions_view], show_progress="full", js=SHOW_LOADING_JS,
+    )
+    photo_event.then(
+        fn=None, inputs=[], outputs=[], js=HIDE_LOADING_JS, show_progress="hidden",
     )
     photo_in.change(
         lambda path: gr.update(value=path, visible=bool(path)),
@@ -1882,21 +1890,33 @@ with gr.Blocks(
         lambda path: gr.update(value=path, visible=bool(path)),
         [photo_out], [photo_out_preview], show_progress="hidden",
     )
-    audit_btn.click(
-        _run_audit_for_workflow, [active_case, locality_dropdown],
+    city_dropdown.change(
+        update_locality_choices,
+        [city_dropdown],
+        [area_dropdown],
+        show_progress="hidden",
+    )
+    audit_event = audit_btn.click(
+        _run_audit_for_workflow, [active_case, city_dropdown, area_dropdown],
         [audit_output, report_output, report_file, deductions_view],
-        show_progress="full",
+        show_progress="full", js=SHOW_LOADING_JS,
+    )
+    audit_event = audit_event.then(
+        fn=None, inputs=[], outputs=[], js=HIDE_LOADING_JS, show_progress="hidden",
     ).then(
         lambda case_id, report: _navigate_to_step(4, case_id, report),
         [active_case, report_output],
         workflow_components,
+        js=SCROLL_TO_TOP_JS,
     )
     gr.HTML(
         '<noscript><p>JavaScript is required to navigate this interactive audit application.</p></noscript>'
     )
 
 
-if __name__ == "__main__":
+def _launch_kwargs() -> dict[str, Any]:
+    configured_port = os.environ.get("PORT") or os.environ.get("GRADIO_SERVER_PORT")
+    hosted = "RENDER" in os.environ or configured_port is not None
     launch_kwargs = {
         "theme": gr.themes.Base(
             primary_hue="blue",
@@ -1904,9 +1924,15 @@ if __name__ == "__main__":
             neutral_hue="slate",
         ),
         "css": APP_CSS,
-        "server_name": "0.0.0.0",
-        "server_port": int(os.environ.get("PORT", 7860)),
+        "server_name": "0.0.0.0" if hosted else "127.0.0.1",
+        "server_port": int(configured_port) if configured_port else None,
     }
+    if not hosted:
+        launch_kwargs["inbrowser"] = True
     if "show_api" in inspect.signature(gr.Blocks.launch).parameters:
         launch_kwargs["show_api"] = False
-    demo.launch(**launch_kwargs)
+    return launch_kwargs
+
+
+if __name__ == "__main__":
+    demo.launch(**_launch_kwargs())

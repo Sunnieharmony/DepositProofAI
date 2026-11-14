@@ -29,7 +29,18 @@ import os
 import re
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Callable
+
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+ENV_FILE = PROJECT_ROOT / ".env"
+if not ENV_FILE.is_file():
+    nested_env_file = PROJECT_ROOT / "DepositAI-Github" / ".env"
+    if nested_env_file.is_file():
+        ENV_FILE = nested_env_file
+load_dotenv(dotenv_path=ENV_FILE, override=True)
 
 import evidence_engine as ee
 
@@ -38,6 +49,13 @@ DEFAULT_GEMINI_ROUTER_URL = "https://generativelanguage.googleapis.com/v1beta/op
 DEFAULT_VLM = "Qwen/Qwen2.5-VL-3B-Instruct"
 DEFAULT_LLM = "google/gemma-2-2b-it"
 DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
+DEFAULT_GEMINI_VISION_MODEL = "gemini-3.1-flash-lite"
+_PROVIDER_API_KEY_VARIABLES = {
+    "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    "huggingface": ("HF_TOKEN", "LLM_API_KEY"),
+    "openai_compatible": ("LLM_API_KEY",),
+    "ollama": ("LLM_API_KEY",),
+}
 
 MAX_IMAGE_BYTES = int(float(os.getenv("MAX_IMAGE_MB", "12")) * 1024 * 1024)
 MAX_IMAGE_SIDE = int(os.getenv("IMAGE_MAX_SIDE", "768"))
@@ -76,41 +94,73 @@ def _set_error(msg: str | None) -> None:
 def _sanitize(msg: str) -> str:
     msg = re.sub(r"hf_[A-Za-z0-9]{6,}", "hf_***", str(msg))
     for variable in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "HF_TOKEN", "LLM_API_KEY"):
-        token = os.getenv(variable) or ""
+        token = _clean_env(os.getenv(variable))
         if token:
             msg = msg.replace(token, "***")
     return msg
 
 
+def _clean_env(value: str | None) -> str:
+    return (value or "").strip().strip("\"'").strip()
+
+
+def _provider_value() -> str:
+    return _clean_env(os.getenv("LLM_PROVIDER")).lower()
+
+
 def _provider() -> str:
-    return os.getenv("LLM_PROVIDER", "huggingface").strip().lower()
+    value = _provider_value()
+    return "gemini" if value in ("", "gemini", "google") else value
 
 
 def _api_key() -> str:
-    if _provider() == "google":
+    for variable in _PROVIDER_API_KEY_VARIABLES.get(_provider(), ()):
+        value = _clean_env(os.getenv(variable))
+        if value:
+            return value
+    return ""
+
+
+def _configuration_error() -> str:
+    provider_value = _provider_value()
+    provider = _provider()
+    if not provider_value:
+        provider_description = "LLM_PROVIDER is unset or empty (defaulting to 'gemini')"
+    else:
+        provider_description = f"LLM_PROVIDER='{provider_value[:80]}'"
+
+    if provider not in _PROVIDER_API_KEY_VARIABLES:
         return (
-            os.getenv("GEMINI_API_KEY")
-            or os.getenv("GOOGLE_API_KEY")
-            or os.getenv("LLM_API_KEY")
-            or ""
-        ).strip()
-    return (os.getenv("LLM_API_KEY") or os.getenv("HF_TOKEN") or "").strip()
+            f"Hosted AI is not configured: {provider_description} is unsupported. "
+            "Supported values and API key variables are gemini (or google)=GEMINI_API_KEY, "
+            "huggingface=HF_TOKEN, openai_compatible=LLM_API_KEY, and ollama=LLM_API_KEY."
+        )
+
+    expected_variable = _PROVIDER_API_KEY_VARIABLES[provider][0]
+    return (
+        f"Hosted AI is not configured: {provider_description}; expected API key "
+        f"variable {expected_variable} is missing or empty."
+    )
+
+
+def get_configuration_error() -> str:
+    """Return a safe provider/key diagnostic without exposing credential values."""
+    return _configuration_error()
 
 
 def _base_url() -> str:
-    default = DEFAULT_GEMINI_ROUTER_URL if _provider() == "google" else DEFAULT_HF_ROUTER_URL
-    return (os.getenv("LLM_BASE_URL") or default).rstrip("/")
+    default = DEFAULT_GEMINI_ROUTER_URL if _provider() == "gemini" else DEFAULT_HF_ROUTER_URL
+    return (_clean_env(os.getenv("LLM_BASE_URL")) or default).rstrip("/")
 
 
 def vision_model() -> str:
-    if _provider() == "google":
-        return (os.getenv("GEMINI_VISION_MODEL", "").strip() or os.getenv("GEMINI_MODEL", "").strip()
-                or DEFAULT_GEMINI_MODEL)
+    if _provider() == "gemini":
+        return os.getenv("GEMINI_VISION_MODEL", "").strip() or DEFAULT_GEMINI_VISION_MODEL
     return os.getenv("HF_VLM_MODEL", "").strip() or DEFAULT_VLM
 
 
 def text_model() -> str:
-    if _provider() == "google":
+    if _provider() == "gemini":
         return (os.getenv("GEMINI_TEXT_MODEL", "").strip() or os.getenv("GEMINI_MODEL", "").strip()
                 or DEFAULT_GEMINI_MODEL)
     return os.getenv("HF_LLM_MODEL", "").strip() or os.getenv("HF_MODEL", "").strip() or DEFAULT_LLM
@@ -122,10 +172,15 @@ def llm_is_configured() -> bool:
     models are reachable; a failed call reports why.
     """
     provider = _provider()
-    if provider not in ("", "google", "huggingface", "openai_compatible", "ollama"):
+    if provider not in _PROVIDER_API_KEY_VARIABLES:
+        _set_error(_configuration_error())
         return False
-    local_endpoint = bool(os.getenv("LLM_BASE_URL")) and ("localhost" in _base_url() or "127.0.0.1" in _base_url())
-    return bool(_api_key()) or local_endpoint
+    local_endpoint = bool(_clean_env(os.getenv("LLM_BASE_URL"))) and (
+        "localhost" in _base_url() or "127.0.0.1" in _base_url()
+    )
+    configured = bool(_api_key()) or local_endpoint
+    _set_error(None if configured else _configuration_error())
+    return configured
 
 
 # --------------------------------------------------------------------------
@@ -193,8 +248,7 @@ def _post_chat(payload: dict, timeout: float) -> dict:
     """POST to {base}/chat/completions. Tests replace this function; it is the only network call."""
     key = _api_key()
     if not key and "localhost" not in _base_url() and "127.0.0.1" not in _base_url():
-        variable = "GEMINI_API_KEY" if _provider() == "google" else "HF_TOKEN"
-        raise LLMError(f"No API key configured for {_provider()}. Set {variable} in your .env file.")
+        raise LLMError(_configuration_error())
     headers = {"Content-Type": "application/json"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
@@ -211,17 +265,17 @@ def _post_chat(payload: dict, timeout: float) -> dict:
             body = ""
         finally:
             exc.close()
-        if _provider() == "google":
+        if _provider() == "gemini":
             hints = {
                 400: "The request or model is unsupported; check the Gemini model ID and request format.",
-                401: "Google rejected the API key. Check that GEMINI_API_KEY is correct.",
+                401: "Google rejected the API key. Check GEMINI_API_KEY or GOOGLE_API_KEY.",
                 403: "Google denied access. Check that the Gemini API is enabled for the key's project and that the key is allowed to use it.",
                 404: "The requested Gemini model or endpoint was not found. Check the model ID.",
                 429: "Gemini quota or rate limit reached. Check the project's AI Studio rate limits and try again later.",
                 500: "Gemini had a server error. Try again later.",
                 503: "Gemini is temporarily unavailable. Try again later.",
             }
-        else:
+        elif _provider() == "huggingface":
             hints = {
                 400: "The provider rejected the request (this model may not accept this input type).",
                 401: "The token was rejected (check HF_TOKEN).",
@@ -229,6 +283,16 @@ def _post_chat(payload: dict, timeout: float) -> dict:
                 403: "Access denied: the token may lack 'Inference Providers' permission, or the model is gated (accept its licence on the Hub).",
                 404: "The model is not available through any provider for your account. Choose another model or append a provider, e.g. ':featherless-ai'.",
                 429: "Rate limited by the provider. Wait a minute and retry.",
+                503: "The model is loading or temporarily unavailable. Retry shortly.",
+            }
+        else:
+            key_variable = _PROVIDER_API_KEY_VARIABLES[_provider()][0]
+            hints = {
+                400: "The provider rejected the request (this model may not accept this input type).",
+                401: f"The provider rejected the API key. Check {key_variable}.",
+                403: "Access denied for this provider or model.",
+                404: "The requested model or endpoint was not found. Check the model ID and LLM_BASE_URL.",
+                429: "Rate limited by the provider. Wait and retry.",
                 503: "The model is loading or temporarily unavailable. Retry shortly.",
             }
         try:
@@ -239,9 +303,9 @@ def _post_chat(payload: dict, timeout: float) -> dict:
             detail = body
         detail = detail or body
         hint = hints.get(exc.code, "")
-        if (_provider() == "google" and "api key" in detail.lower()
+        if (_provider() == "gemini" and "api key" in detail.lower()
                 and ("invalid" in detail.lower() or "not valid" in detail.lower())):
-            hint = "Google says the Gemini API key is invalid. Check GEMINI_API_KEY in your .env file."
+            hint = "Google says the Gemini API key is invalid. Check GEMINI_API_KEY or GOOGLE_API_KEY in your .env file."
         raise LLMError(
             f"Model request failed (HTTP {exc.code}). {hint} {detail}".strip()
         ) from exc
@@ -335,12 +399,13 @@ def explain_repair_benchmark_with_llm(benchmark: dict[str, Any]) -> str | None:
         ],
     })
     prompt = (
-        "Explain the meaning and limitations of this deterministic repair-rate comparison in plain "
-        "language. It uses sample data, not verified quotations. Do not determine whether the landlord "
-        "is legally entitled to deduct the amount, do not change the calculation, and do not claim the "
-        "sample proves the actual repair cost. Do not include any digits, currency symbols, percentages, "
-        "or new price estimates in your explanation. Return only JSON with one string property named "
-        "'explanation'. Facts:\n" + json.dumps(facts, ensure_ascii=False)
+        "In 2-3 concise executive sentences, explain the meaning and limitations of this repair-rate "
+        "comparison. Use plain language without filler, repeated facts, or internal system terminology. It uses sample data, not "
+        "verified quotations. Do not determine whether the landlord is legally entitled to deduct the "
+        "amount, do not change the calculation, and do not claim the sample proves the actual repair "
+        "cost. Do not include any digits, currency symbols, percentages, or new price estimates in "
+        "your explanation. Return only JSON with one string property named 'explanation'. Facts:\n"
+        + json.dumps(facts, ensure_ascii=False)
     )
     try:
         result = _chat_json(
@@ -548,11 +613,12 @@ def _build_facts(payload: dict, base: dict) -> tuple[dict, dict[str, dict]]:
 _ASSESS_PROMPT = (
     "You help a tenant review one security-deposit deduction. Use ONLY the FACTS below. Do not invent documents, "
     "clauses, amounts, dates or quotations. Do not decide legal liability or responsibility. Keep evidence of damage, "
-    "of a repair, of cost, and of contract terms separate. Missing evidence is not proof that a claim is false.\n"
+    "of a repair, of cost, and of contract terms separate. Missing evidence is not proof that a claim is false. "
+    "Do not use internal implementation labels such as rules-engine terminology in explanations or limitations.\n"
     "FACTS:\n{facts}\n\n"
     "Reply with ONE JSON object and nothing else:\n"
     '{{"classification_suggestion": "Supported" | "Inconsistent" | "Insufficiently Documented",'
-    ' "explanation": "3-5 plain sentences explaining what the evidence shows and what is missing; refer to clauses by id (C1...) and do not copy quotations",'
+    ' "explanation": "2-3 concise executive sentences stating the key finding, strongest evidence, and material gap or limitation; avoid filler, repeated labels, internal system jargon, and copied quotations; refer to clauses by id (C1...)",'
     ' "cited_clause_ids": ["C1"],'
     ' "missing_evidence": ["short items"],'
     ' "contradictions": ["short items, only if the FACTS show a conflict"],'

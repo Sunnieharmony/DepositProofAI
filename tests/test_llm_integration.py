@@ -37,15 +37,20 @@ class LLMIntegrationTests(unittest.TestCase):
 
     def test_both_prepared_images_reach_the_hosted_request(self):
         image_info = {"original_size": (100, 100), "sent_size": (100, 100), "sent_kb": 1, "format": "PNG"}
-        with patch.object(llm, "prepare_image", side_effect=[
-            ("data:image/jpeg;base64,movein", image_info),
-            ("data:image/jpeg;base64,moveout", image_info),
+        with patch.dict(os.environ, {
+            "LLM_PROVIDER": "gemini",
+            "GEMINI_API_KEY": "test-gemini-key",
+        }, clear=True), patch.object(llm, "prepare_image", side_effect=[
+                ("data:image/jpeg;base64,movein", image_info),
+                ("data:image/jpeg;base64,moveout", image_info),
         ]), patch.object(llm, "_post_chat", return_value=self._vision_response()) as request:
             result = llm.analyze_image_pair_with_llm("movein.png", "moveout.png", "living room wall")
 
         self.assertIsNotNone(result)
         self.assertEqual(result["images_sent"], 2)
-        content = request.call_args.args[0]["messages"][0]["content"]
+        payload = request.call_args.args[0]
+        self.assertEqual(payload["model"], llm.DEFAULT_GEMINI_VISION_MODEL)
+        content = payload["messages"][0]["content"]
         sent_images = [part for part in content if part.get("type") == "image_url"]
         self.assertEqual(len(sent_images), 2)
 
@@ -150,6 +155,7 @@ class LLMIntegrationTests(unittest.TestCase):
 
         self.assertIn("not a verified quote", explanation)
         prompt = request.call_args.args[0]["messages"][0]["content"]
+        self.assertIn("2-3 concise executive sentences", prompt)
         self.assertIn("do not change the calculation", prompt)
         self.assertIn('"lower": 8000', prompt)
 
@@ -239,6 +245,101 @@ class LLMIntegrationTests(unittest.TestCase):
             "HF_TOKEN": "test-hf-token",
         }, clear=True):
             self.assertFalse(llm.llm_is_configured())
+
+    def test_provider_and_api_key_are_trimmed_and_unquoted(self):
+        with patch.dict(os.environ, {
+            "LLM_PROVIDER": ' " google " ',
+            "GEMINI_API_KEY": ' " demo-google-key " ',
+        }, clear=True):
+            self.assertTrue(llm.llm_is_configured())
+            self.assertEqual(llm._provider(), "gemini")
+            self.assertEqual(llm._api_key(), "demo-google-key")
+
+    def test_missing_key_error_names_provider_and_expected_variable(self):
+        with patch.dict(os.environ, {
+            "LLM_PROVIDER": ' " Google " ',
+            "GEMINI_API_KEY": "",
+            "GOOGLE_API_KEY": "",
+            "LLM_API_KEY": "",
+            "HF_TOKEN": "",
+        }, clear=True):
+            self.assertFalse(llm.llm_is_configured())
+
+        message = llm.get_last_error()
+        self.assertIn("LLM_PROVIDER='google'", message)
+        self.assertIn("GEMINI_API_KEY", message)
+        self.assertNotIn("demo-google-key", message)
+
+    def test_unset_provider_defaults_to_gemini(self):
+        with patch.dict(os.environ, {
+            "GEMINI_API_KEY": "demo-google-key",
+            "GOOGLE_API_KEY": "",
+            "HF_TOKEN": "",
+            "LLM_API_KEY": "",
+        }, clear=True):
+            self.assertEqual(llm._provider(), "gemini")
+            self.assertTrue(llm.llm_is_configured())
+            self.assertEqual(llm.text_model(), "gemini-3.1-flash-lite")
+            self.assertEqual(llm.vision_model(), "gemini-3.1-flash-lite")
+
+    def test_google_api_key_is_supported_as_a_gemini_alias(self):
+        with patch.dict(os.environ, {
+            "LLM_PROVIDER": "gemini",
+            "GEMINI_API_KEY": "",
+            "GOOGLE_API_KEY": "google-api-alias",
+            "HF_TOKEN": "",
+        }, clear=True):
+            self.assertEqual(llm._api_key(), "google-api-alias")
+            self.assertTrue(llm.llm_is_configured())
+
+    def test_unset_gemini_provider_does_not_use_huggingface_credentials(self):
+        with patch.dict(os.environ, {
+            "GEMINI_API_KEY": "",
+            "GOOGLE_API_KEY": "",
+            "HF_TOKEN": "test-hf-token",
+            "LLM_API_KEY": "generic-token",
+        }, clear=True):
+            self.assertEqual(llm._provider(), "gemini")
+            self.assertFalse(llm.llm_is_configured())
+
+        message = llm.get_last_error()
+        self.assertIn("defaulting to 'gemini'", message)
+        self.assertIn("GEMINI_API_KEY", message)
+        self.assertNotIn("HF_TOKEN", message)
+
+    def test_vision_model_does_not_inherit_a_text_only_gemini_model(self):
+        with patch.dict(os.environ, {
+            "LLM_PROVIDER": "gemini",
+            "GEMINI_MODEL": "text-only-model",
+            "GEMINI_VISION_MODEL": "",
+        }, clear=True):
+            self.assertEqual(llm.text_model(), "text-only-model")
+            self.assertEqual(llm.vision_model(), llm.DEFAULT_GEMINI_VISION_MODEL)
+
+    def test_empty_provider_error_reports_default_and_expected_variable(self):
+        with patch.dict(os.environ, {
+            "LLM_PROVIDER": ' "  " ',
+            "GEMINI_API_KEY": "",
+            "GOOGLE_API_KEY": "",
+            "HF_TOKEN": "",
+            "LLM_API_KEY": "",
+        }, clear=True):
+            self.assertFalse(llm.llm_is_configured())
+
+        message = llm.get_last_error()
+        self.assertIn("LLM_PROVIDER is unset or empty", message)
+        self.assertIn("gemini", message)
+        self.assertIn("GEMINI_API_KEY", message)
+        self.assertNotIn("HF_TOKEN", message)
+
+    def test_custom_providers_use_llm_api_key(self):
+        for provider in ("openai_compatible", "ollama"):
+            with self.subTest(provider=provider), patch.dict(os.environ, {
+                "LLM_PROVIDER": provider,
+                "LLM_API_KEY": ' " custom-key " ',
+            }, clear=True):
+                self.assertTrue(llm.llm_is_configured())
+                self.assertEqual(llm._api_key(), "custom-key")
 
     def test_google_invalid_api_key_error_has_actionable_guidance(self):
         error = llm.urllib.error.HTTPError(

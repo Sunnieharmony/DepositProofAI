@@ -5,100 +5,209 @@ import re
 import uuid
 from pathlib import Path
 from xml.sax.saxutils import escape
+
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.enums import TA_LEFT
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    KeepTogether,
+    HRFlowable,
+)
+
+
+_BORDER = colors.HexColor("#E2E8F0")
+_MUTED_ROW = colors.HexColor("#F8FAFC")
+_STATUS_COLORS = {
+    "Supported": (colors.HexColor("#DCFCE7"), colors.HexColor("#166534")),
+    "Insufficiently Documented": (
+        colors.HexColor("#FEF3C7"),
+        colors.HexColor("#92400E"),
+    ),
+    "Inconsistent": (colors.HexColor("#FEE2E2"), colors.HexColor("#991B1B")),
+}
 
 
 def _text(value) -> str:
     return escape(str(value))
 
 
-def _assessment_modes_summary(findings) -> str:
-    labels = {
-        "llm": "LLM explanation with rules-engine classification",
-        "fallback_after_llm_error": "rules-based fallback after LLM failure",
-        "rules_fallback_not_llm": "rules-only (LLM not used)",
-    }
-    counts = {}
-    for finding in findings:
-        mode = finding.get("mode", "rules_fallback_not_llm")
-        label = labels.get(mode, "rules-based assessment")
-        counts[label] = counts.get(label, 0) + 1
-    return "; ".join(f"{count} {label}" for label, count in counts.items()) or "No deduction findings."
+def _money(value) -> str:
+    return f"INR {float(value or 0):,.2f}"
+
+
+def _title_case(value) -> str:
+    return " ".join(str(value or "Deduction").split()).title()
+
+
+def _report_limitations(value) -> str:
+    limitations = str(value or "Not provided.")
+    if re.search(r"\brules[- ]engine\b|\bclassification rules\b", limitations, re.IGNORECASE):
+        return (
+            "This assessment is limited to the evidence provided and does not determine "
+            "responsibility or legal liability."
+        )
+    return limitations
+
+
+def _is_yes(value) -> bool:
+    return value is True or (
+        isinstance(value, str) and value.strip().lower() in {"true", "yes"}
+    )
+
+
+def _photo_match_text(photo) -> str:
+    if photo.get("not_reliably_comparable"):
+        return "Not verified (the images were reported as not reliably comparable)."
+
+    comparable = photo.get("comparable")
+    same_area = photo.get("same_area_visible_in_both")
+    if _is_yes(comparable) and _is_yes(same_area):
+        return "Verified (the same area is visible in both move-in and move-out photos)."
+    if _is_yes(comparable):
+        return "Not confirmed (the same area is not confirmed in both photos)."
+    if isinstance(comparable, str) and comparable.strip().lower() == "no":
+        return "Not verified (the photos were reported as not comparable)."
+    if same_area is False or (
+        isinstance(same_area, str) and same_area.strip().lower() == "false"
+    ):
+        return "Not verified (the same area is not visible in both photos)."
+    return "Not confirmed (the comparison does not confirm a matching area)."
+
+
+def _section_heading(text: str, styles):
+    return KeepTogether([
+        Paragraph(_text(text), styles["SectionHeading"]),
+        HRFlowable(
+            width="100%",
+            thickness=0.6,
+            color=_BORDER,
+            spaceBefore=0,
+            spaceAfter=5,
+        ),
+    ])
+
+
+def _banded_table(rows, col_widths):
+    table = Table(rows, colWidths=col_widths, repeatRows=1, splitByRow=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), _BORDER),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, _MUTED_ROW]),
+        ("GRID", (0, 0), (-1, -1), 0.35, _BORDER),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    return table
 
 
 def _append_repair_benchmark(
-    story, benchmark, styles, heading="Repair-price benchmark (context only; does not determine classification)"
+    story,
+    benchmark,
+    styles,
+    heading="Repair Price Intelligence Benchmark",
 ) -> None:
     if not benchmark:
         return
-    story.append(Paragraph(heading, styles["Heading3"]))
+
+    story.append(_section_heading(heading, styles))
     if benchmark.get("status") != "matched":
-        story.append(Paragraph(
-            "The deduction amount was unavailable for comparison."
-            if benchmark.get("status") == "no_amount"
-            else "No matching sample-rate category was available for this deduction at the selected locality.",
-            styles["SmallText"],
-        ))
+        message = benchmark.get("explanation")
+        if not message:
+            message = (
+                "The deduction amount was unavailable for comparison."
+                if benchmark.get("status") == "no_amount"
+                else "No matching sample-rate category was available for this deduction at the selected locality."
+            )
+        story.append(Paragraph(_text(message), styles["ReportBody"]))
         return
-    story.append(Paragraph(
-        f"<b>Comparison:</b> {_text(benchmark.get('match_description', 'Sample-rate comparison'))}; "
-        f"{_text(benchmark.get('city', ''))}"
-        + (f", {_text(benchmark['locality'])}" if benchmark.get("locality") else "")
-        + f"; category: {_text(benchmark.get('category', 'not recorded'))}"
-        + f"; {_text(benchmark.get('record_count', 0))} sample record(s).",
-        styles["SmallText"]
-    ))
+
+    city = str(benchmark.get("city") or "").strip()
+    locality = str(benchmark.get("locality") or "").strip()
+    place = ", ".join(part for part in (city, locality) if part) or "the selected locality"
+    category = str(benchmark.get("category") or "local repair").strip()
+    lower = float(benchmark.get("lower") or 0)
+    upper = float(benchmark.get("upper") or 0)
+    claimed_amount = float(benchmark.get("claimed_amount") or 0)
     unit_suffix = f" per {_text(benchmark['unit'])}" if benchmark.get("unit") else ""
-    story.append(Paragraph(
-        f"<b>Sample range:</b> INR {float(benchmark.get('lower') or 0):,.2f}–"
-        f"INR {float(benchmark.get('upper') or 0):,.2f}{unit_suffix}. "
-        f"<b>Claim position:</b> {_text(benchmark.get('position', 'not stated'))}; "
-        f"<b>difference from nearest boundary:</b> INR {float(benchmark.get('difference') or 0):,.2f}"
-        + (
-            f" ({float(benchmark['difference_percent']):.1f}%)"
-            if benchmark.get("difference_percent") is not None and benchmark.get("position") != "within"
-            else ""
+    range_text = f"{_money(lower)} to {_money(upper)}{unit_suffix}"
+    position = benchmark.get("position")
+    if position == "below":
+        difference = benchmark.get("difference_percent")
+        comparison = (
+            f"is {float(difference):.1f}% below"
+            if difference is not None
+            else "is below"
         )
-        + ".",
-        styles["SmallText"]
-    ))
-    benchmark_rows = [[
-        Paragraph("<b>City / locality</b>", styles["SmallText"]),
-        Paragraph("<b>Category / item</b>", styles["SmallText"]),
-        Paragraph("<b>Listed sample range</b>", styles["SmallText"]),
-    ]]
-    for row in benchmark.get("matched_records", [])[:8]:
-        category_or_item = (
-            row.get("category")
-            or benchmark.get("category")
-            or row.get("item", "")
+    elif position == "above":
+        difference = benchmark.get("difference_percent")
+        comparison = (
+            f"is {float(difference):.1f}% above"
+            if difference is not None
+            else "is above"
         )
-        benchmark_rows.append([
-            Paragraph(_text(f"{row.get('city', '')}, {row.get('locality', '')}")[:300], styles["SmallText"]),
-            Paragraph(_text(category_or_item)[:300], styles["SmallText"]),
-            Paragraph(
-                f"INR {float(row.get('minimum') or 0):,.2f}–INR {float(row.get('maximum') or 0):,.2f} "
-                + (f"per {_text(row['unit'])}" if row.get("unit") else ""),
-                styles["SmallText"],
-            ),
-        ])
-    benchmark_table = Table(
-        benchmark_rows,
-        colWidths=[2.0*inch, 1.7*inch, 2.5*inch],
-        repeatRows=1,
+    elif position == "within":
+        comparison = "falls within"
+    else:
+        comparison = "was compared with"
+
+    count = int(benchmark.get("record_count") or 0)
+    record_text = (
+        f"based on {count} matched sample record{'s' if count != 1 else ''}"
+        if count
+        else "based on the available matched samples"
     )
-    benchmark_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#E2E8F0")),
-        ("GRID", (0,0), (-1,-1), 0.35, colors.HexColor("#CBD5E1")),
-        ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("PADDING", (0,0), (-1,-1), 4),
-    ]))
-    story.append(benchmark_table)
+    damage_cause = str(benchmark.get("damage_cause") or "").strip()
+    claim_subject = (
+        f"For {_text(damage_cause)}, the claimed amount"
+        if damage_cause
+        else "The claimed amount"
+    )
+    story.append(Paragraph(
+        f"{claim_subject} of {_money(claimed_amount)} {comparison} the typical "
+        f"{_text(place)} range for {_text(category)} of {range_text} "
+        f"({record_text}).",
+        styles["ReportBody"],
+    ))
+
+    records = benchmark.get("matched_records") or []
+    if records:
+        rows = [[
+            Paragraph("City / locality", styles["TableHeader"]),
+            Paragraph("Category / item", styles["TableHeader"]),
+            Paragraph("Local sample range", styles["TableHeader"]),
+        ]]
+        for row in records[:8]:
+            category_or_item = (
+                row.get("category")
+                or benchmark.get("category")
+                or row.get("item", "")
+            )
+            sample_range = (
+                f"{_money(row.get('minimum'))} to {_money(row.get('maximum'))}"
+                + (f" per {_text(row['unit'])}" if row.get("unit") else "")
+            )
+            rows.append([
+                Paragraph(
+                    _text(f"{row.get('city', '')}, {row.get('locality', '')}"),
+                    styles["TableCell"],
+                ),
+                Paragraph(_text(category_or_item), styles["TableCell"]),
+                Paragraph(sample_range, styles["TableCell"]),
+            ])
+        story.append(KeepTogether([
+            _banded_table(rows, [2.0 * inch, 2.0 * inch, 3.3 * inch]),
+            Spacer(1, 5),
+        ]))
+
     story.append(Paragraph(
         _text(benchmark.get(
             "sample_data_warning",
@@ -108,340 +217,436 @@ def _append_repair_benchmark(
     ))
     if benchmark.get("llm_explanation"):
         story.append(Paragraph(
-            "<b>Optional hosted-model explanation:</b> " + _text(benchmark["llm_explanation"])
-            + " (This does not change the calculation or audit classification.)",
+            "<b>Context:</b> " + _text(benchmark["llm_explanation"])
+            + " This explanation does not change the calculation or audit classification.",
             styles["SmallText"],
         ))
 
 
+def _append_photo_comparison(story, photo, styles, title=None, finding=None):
+    if title:
+        story.append(_section_heading(title, styles))
+    if photo.get("mode") != "llm_analyzed":
+        story.append(Paragraph(
+            "A linked photo pair is available, but no completed comparison is stored. "
+            + _text(photo.get("error") or photo.get("limitations") or "No analysis details are available."),
+            styles["ReportBody"],
+        ))
+        return
+
+    if photo.get("observation"):
+        story.append(Paragraph(
+            "<b>Summary:</b> " + _text(photo["observation"])[:1500],
+            styles["ReportBody"],
+        ))
+
+    story.append(Paragraph(
+        "<b>Visual Match:</b> " + _text(_photo_match_text(photo)),
+        styles["ReportBody"],
+    ))
+
+    for key, label in (
+        ("move_in_condition", "Move-in condition"),
+        ("move_out_condition", "Move-out condition"),
+    ):
+        if photo.get(key):
+            story.append(Paragraph(
+                f"<b>{label}:</b> {_text(photo[key])[:1000]}",
+                styles["ReportBody"],
+            ))
+
+    changes = photo.get("observed_changes") or []
+    if changes:
+        rows = [[
+            Paragraph("Observed feature / location", styles["TableHeader"]),
+            Paragraph("Move-in condition", styles["TableHeader"]),
+            Paragraph("Move-out condition", styles["TableHeader"]),
+            Paragraph("Interpretation", styles["TableHeader"]),
+        ]]
+        for change in changes[:8]:
+            feature = change.get("feature") or "Visible feature"
+            if change.get("location"):
+                feature += f" ({change['location']})"
+            rows.append([
+                Paragraph(_text(feature)[:400], styles["TableCell"]),
+                Paragraph(
+                    _text(change.get("move_in_condition") or "Not described")[:400],
+                    styles["TableCell"],
+                ),
+                Paragraph(
+                    _text(change.get("move_out_condition") or "Not described")[:400],
+                    styles["TableCell"],
+                ),
+                Paragraph(
+                    _text(change.get("interpretation") or "No interpretation provided")[:500],
+                    styles["TableCell"],
+                ),
+            ])
+        comparison_table = _banded_table(
+            rows,
+            [1.35 * inch, 1.55 * inch, 1.55 * inch, 2.85 * inch],
+        )
+        story.append(KeepTogether([
+            _section_heading("Move-In vs. Move-Out Comparison", styles),
+            comparison_table,
+            Spacer(1, 5),
+        ]))
+    elif photo.get("visible_differences"):
+        story.append(Paragraph(
+            "<b>Observed changes:</b> "
+            + _text("; ".join(photo["visible_differences"]))[:1200],
+            styles["ReportBody"],
+        ))
+    else:
+        story.append(Paragraph(
+            "<b>Observed changes:</b> No specific visible differences were reported.",
+            styles["ReportBody"],
+        ))
+
+    uncertainty = photo.get("model_uncertainty")
+    if uncertainty:
+        story.append(Paragraph(
+            "<b>Comparison uncertainty:</b> "
+            + _text(uncertainty)
+            + " (qualitative, not a calibrated confidence score).",
+            styles["SmallText"],
+        ))
+    if photo.get("possible_damage_or_deterioration"):
+        story.append(Paragraph(
+            "<b>Possible damage (not a finding of responsibility):</b> "
+            + _text("; ".join(photo["possible_damage_or_deterioration"]))[:1200],
+            styles["SmallText"],
+        ))
+    if photo.get("not_reliably_comparable"):
+        story.append(Paragraph(
+            "<b>Comparison limitations:</b> "
+            + _text("; ".join(photo["not_reliably_comparable"]))[:1000],
+            styles["SmallText"],
+        ))
+    if photo.get("limitations"):
+        story.append(Paragraph(
+            "<b>Model-stated limitations:</b> " + _text(photo["limitations"])[:1000],
+            styles["SmallText"],
+        ))
+    if finding:
+        story.append(Paragraph(
+            f"<b>Relevance to deduction:</b> This stored photo comparison concerns "
+            f"{_text(finding.get('photo_item_name') or 'the linked photo item')}; "
+            "it was not a deduction assessment. It may provide visual context for "
+            f"{_text(finding.get('description', 'the claim'))}, but does not establish "
+            "that the claimed repair was required or its cost.",
+            styles["SmallText"],
+        ))
+    story.append(Paragraph(
+        "Photographs can show visible differences, but cannot independently establish when a change "
+        "occurred, who caused it, actual repair cost, or legal responsibility.",
+        styles["SmallText"],
+    ))
+
+
 def generate_audit_pdf(case, findings, totals, reports_dir: Path, photo_pairs=None) -> str:
+    case = {key: case[key] for key in case.keys()}
     reports_dir = Path(reports_dir)
     reports_dir.mkdir(parents=True, exist_ok=True)
     path = reports_dir / f"depositproof_audit_{case['id']}_{uuid.uuid4().hex[:6]}.pdf"
     doc = SimpleDocTemplate(
-        str(path), pagesize=letter,
-        rightMargin=0.6*inch, leftMargin=0.6*inch,
-        topMargin=0.6*inch, bottomMargin=0.6*inch
+        str(path),
+        pagesize=letter,
+        rightMargin=0.6 * inch,
+        leftMargin=0.6 * inch,
+        topMargin=0.65 * inch,
+        bottomMargin=0.65 * inch,
     )
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="TitleCenter", parent=styles["Title"], alignment=TA_CENTER, textColor=colors.HexColor("#17365D")))
     styles.add(ParagraphStyle(
-        name="ReportBody", parent=styles["BodyText"], fontName="Helvetica",
-        fontSize=10, leading=15, textColor=colors.HexColor("#263445"),
-        wordWrap="CJK", spaceAfter=5,
+        name="ReportTitle",
+        parent=styles["Title"],
+        fontName="Helvetica-Bold",
+        fontSize=18,
+        leading=22,
+        alignment=TA_LEFT,
+        textColor=colors.HexColor("#17365D"),
+        spaceAfter=2,
     ))
     styles.add(ParagraphStyle(
-        name="SmallText", parent=styles["ReportBody"], fontSize=9, leading=13,
+        name="ReportSubtitle",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=10,
+        leading=14,
+        textColor=colors.HexColor("#475569"),
+        spaceAfter=4,
     ))
     styles.add(ParagraphStyle(
-        name="DeductionTitle", parent=styles["Heading2"], fontSize=18,
-        leading=22, textColor=colors.HexColor("#17365D"), wordWrap="CJK",
-        spaceBefore=12, spaceAfter=4, keepWithNext=True,
+        name="ReportBody",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=9.5,
+        leading=13.3,
+        textColor=colors.HexColor("#334155"),
+        wordWrap="CJK",
+        spaceAfter=6,
     ))
     styles.add(ParagraphStyle(
-        name="SectionHeading", parent=styles["Heading3"], fontSize=12,
-        leading=16, textColor=colors.HexColor("#17365D"), spaceBefore=9,
-        spaceAfter=5, keepWithNext=True,
+        name="SmallText",
+        parent=styles["ReportBody"],
+        fontSize=8.5,
+        leading=11.5,
+        spaceAfter=4,
     ))
     styles.add(ParagraphStyle(
-        name="StatusText", parent=styles["ReportBody"], fontSize=11,
-        leading=15, textColor=colors.HexColor("#713F12"),
-        backColor=colors.HexColor("#FEF3C7"),
-        borderColor=colors.HexColor("#F2C66D"), borderWidth=0.8,
-        borderPadding=8, spaceBefore=4, spaceAfter=9,
+        name="SectionHeading",
+        parent=styles["Heading3"],
+        fontName="Helvetica-Bold",
+        fontSize=11,
+        leading=14.5,
+        textColor=colors.HexColor("#17365D"),
+        spaceBefore=10,
+        spaceAfter=4,
+        keepWithNext=True,
     ))
     styles.add(ParagraphStyle(
-        name="PassageText", parent=styles["SmallText"],
-        backColor=colors.HexColor("#F8FAFC"),
-        borderColor=colors.HexColor("#DCE4EE"), borderWidth=0.6,
-        borderPadding=8, spaceBefore=4, spaceAfter=6,
+        name="TableHeader",
+        parent=styles["SmallText"],
+        fontName="Helvetica-Bold",
+        textColor=colors.HexColor("#1E293B"),
+        spaceAfter=0,
     ))
+    styles.add(ParagraphStyle(
+        name="TableCell",
+        parent=styles["SmallText"],
+        fontSize=8.2,
+        leading=10.6,
+        spaceAfter=0,
+    ))
+    styles.add(ParagraphStyle(
+        name="CardTitle",
+        parent=styles["ReportBody"],
+        fontName="Helvetica-Bold",
+        fontSize=10,
+        leading=13,
+        textColor=colors.HexColor("#17365D"),
+        spaceAfter=0,
+    ))
+    styles.add(ParagraphStyle(
+        name="CardMeta",
+        parent=styles["SmallText"],
+        fontSize=8,
+        leading=10.5,
+        spaceAfter=0,
+    ))
+    styles.add(ParagraphStyle(
+        name="StatusBadge",
+        parent=styles["SmallText"],
+        fontName="Helvetica-Bold",
+        fontSize=8,
+        leading=10,
+        alignment=TA_LEFT,
+        spaceAfter=0,
+    ))
+    styles.add(ParagraphStyle(
+        name="ClauseHeader",
+        parent=styles["SmallText"],
+        fontName="Helvetica-Bold",
+        fontSize=8,
+        leading=10,
+        textColor=colors.HexColor("#1D4ED8"),
+        spaceAfter=0,
+    ))
+    styles.add(ParagraphStyle(
+        name="ClauseText",
+        parent=styles["ReportBody"],
+        fontSize=9,
+        leading=12.4,
+        spaceAfter=0,
+    ))
+
+    claimed_total = float(case.get("claimed_deductions") or 0)
+    itemized_total = sum(float(finding.get("amount") or 0) for finding in findings)
+
     story = [
-        Paragraph("DepositProof AI", styles["TitleCenter"]),
-        Paragraph("Rental Security Deposit Evidence Audit", styles["Heading2"]),
-        Paragraph(f"<b>Case:</b> {_text(case['name'])} &nbsp;&nbsp; <b>Case ID:</b> {_text(case['id'])}", styles["BodyText"]),
-        Spacer(1, 10),
+        Paragraph("DepositProof AI", styles["ReportTitle"]),
+        Paragraph("Rental Security Deposit Evidence Audit", styles["ReportSubtitle"]),
+        Paragraph(
+            f"<b>Case:</b> {_text(case.get('name', ''))}"
+            f" &nbsp;&nbsp; <b>Case ID:</b> {_text(case.get('id', ''))}",
+            styles["ReportBody"],
+        ),
+        Paragraph(
+            "<b>Recommended refund basis:</b> Security deposit less verified deductions, "
+            "floored at zero.",
+            styles["SmallText"],
+        ),
     ]
-    summary = [
-        ["Metric", "Amount"],
-        ["Security deposit", f"INR {case['deposit']:,.2f}"],
-        ["Landlord-claimed deductions", f"INR {case['claimed_deductions']:,.2f}"],
-        ["Proposed refund", "Not provided" if case["proposed_refund"] is None else f"INR {case['proposed_refund']:,.2f}"],
-        ["Supported-classification total", f"INR {totals.get('Supported', 0):,.2f}"],
-        ["Inconsistent-classification total", f"INR {totals.get('Inconsistent', 0):,.2f}"],
-        ["Insufficiently documented total", f"INR {totals.get('Insufficiently Documented', 0):,.2f}"],
-    ]
-    table = Table(summary, colWidths=[3.8*inch, 2.2*inch], repeatRows=1)
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#17365D")),
-        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-        ("GRID", (0,0), (-1,-1), 0.4, colors.HexColor("#CBD5E1")),
-        ("BACKGROUND", (0,1), (-1,-1), colors.HexColor("#F8FAFC")),
-        ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("PADDING", (0,0), (-1,-1), 6),
-    ]))
-    story += [
-        table,
-        Spacer(1, 8),
-        Paragraph(f"<b>Assessment modes by deduction:</b> {_text(_assessment_modes_summary(findings))}", styles["SmallText"]),
-        Spacer(1, 14),
-    ]
-    for i, f in enumerate(findings, 1):
-        classification = f.get("classification", "Insufficiently Documented")
+    proposed_refund = case.get("proposed_refund")
+    if proposed_refund is not None:
         story.append(Paragraph(
-            f"{i:02d} — {_text(f.get('description', 'Deduction'))}",
-            styles["DeductionTitle"],
+            f"<b>Proposed refund:</b> {_money(proposed_refund)}",
+            styles["SmallText"],
         ))
+
+    difference = claimed_total - itemized_total
+    if difference > 0.005:
         story.append(Paragraph(
-            f"<b>Claimed amount:</b> INR {float(f.get('amount') or 0):,.2f}",
+            f"<b>Unitemized claimed balance:</b> {_money(difference)} of the landlord's "
+            "claimed deductions is not itemized in the findings below.",
             styles["ReportBody"],
         ))
-        story.append(Paragraph("Final classification", styles["SectionHeading"]))
+    elif difference < -0.005:
         story.append(Paragraph(
-            f"<b>Final classification:</b> {_text(classification)}",
-            styles["StatusText"],
+            f"<b>Reconciliation:</b> Itemized deductions exceed the landlord's stated "
+            f"total by {_money(abs(difference))}.",
+            styles["ReportBody"],
         ))
-        assessment_details = [[
-            Paragraph(
-                "<b>Assessment method</b><br/>" + _text(f.get(
-                    "assessment_method",
-                    "Rules-based assessment; hosted LLM use not recorded.",
-                )),
-                styles["SmallText"],
-            ),
-            Paragraph(
-                "<b>Rules-engine classification</b><br/>" + _text(f.get(
-                    "rules_classification", classification,
-                )),
-                styles["SmallText"],
-            ),
-        ]]
-        assessment_table = Table(assessment_details, colWidths=[3.65*inch, 3.65*inch])
-        assessment_table.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#F8FAFC")),
-            ("BOX", (0,0), (-1,-1), 0.5, colors.HexColor("#DCE4EE")),
-            ("INNERGRID", (0,0), (-1,-1), 0.35, colors.HexColor("#DCE4EE")),
-            ("VALIGN", (0,0), (-1,-1), "TOP"),
-            ("PADDING", (0,0), (-1,-1), 8),
+
+    story.append(_section_heading("Deduction Breakdown", styles))
+    for i, finding in enumerate(findings, 1):
+        classification = finding.get("classification", "Insufficiently Documented")
+        status_background, status_foreground = _STATUS_COLORS.get(
+            classification,
+            _STATUS_COLORS["Insufficiently Documented"],
+        )
+        title = f"{i:02d} - {_title_case(finding.get('description', 'Deduction'))}"
+        status_style = ParagraphStyle(
+            name=f"StatusBadge{i}",
+            parent=styles["StatusBadge"],
+            textColor=status_foreground,
+        )
+        card = Table(
+            [[
+                Paragraph(_text(title), styles["CardTitle"]),
+                Paragraph(
+                    f"<b>Claimed</b><br/>{_money(finding.get('amount'))}",
+                    styles["CardMeta"],
+                ),
+                Paragraph(_text(classification), status_style),
+            ]],
+            colWidths=[3.35 * inch, 1.45 * inch, 2.5 * inch],
+        )
+        card.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (1, 0), colors.white),
+            ("BACKGROUND", (2, 0), (2, 0), status_background),
+            ("BOX", (0, 0), (-1, -1), 0.7, _BORDER),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
         ]))
-        story.append(Paragraph("Assessment details", styles["SectionHeading"]))
-        story.append(assessment_table)
-        story.append(Paragraph("Explanation", styles["SectionHeading"]))
-        explanation = str(f.get("explanation") or "No explanation available.")
+        story.append(KeepTogether([card, Spacer(1, 6)]))
+
+        explanation = str(finding.get("explanation") or "No explanation available.")
+        story.append(_section_heading("Executive Takeaway", styles))
         for paragraph in re.split(r"\n\s*\n", explanation.strip()):
             if paragraph.strip():
                 story.append(Paragraph(
                     _text(paragraph).replace("\n", "<br/>"),
                     styles["ReportBody"],
                 ))
-        clauses = f.get("clauses") or []
+
+        clauses = finding.get("clauses") or []
         if clauses:
-            story.append(Paragraph("Relevant agreement passages", styles["SectionHeading"]))
-            for c in clauses[:5]:
-                verified = "Verified" if c.get("quote_verified") else "Not verified"
-                quote = _text(c.get("quote", "")).replace("\n", "<br/>")
-                story.append(Paragraph(
-                    f"<b>Source document:</b> {_text(c.get('filename', 'Agreement'))}<br/>"
-                    f"<b>Page number:</b> {_text(c.get('page', 'unknown'))}<br/>"
-                    f"<b>Clause text:</b><br/>{quote}<br/>"
-                    f"<b>Quotation verification:</b> {verified}",
-                    styles["PassageText"],
-                ))
-        story.append(Paragraph("Limitations", styles["SectionHeading"]))
+            story.append(_section_heading("Relevant Agreement Clauses", styles))
+            for clause_number, clause in enumerate(clauses[:5], 1):
+                verification = (
+                    "Clause Verified" if clause.get("quote_verified")
+                    else "Clause Not Verified"
+                )
+                header = (
+                    f"{clause_number:02d}_{_text(clause.get('filename', 'Agreement'))}"
+                    f" | Page {_text(clause.get('page', 'unknown'))} | {verification}"
+                )
+                quote = _text(clause.get("quote", "")).replace("\n", "<br/>")
+                callout = Table(
+                    [
+                        [Paragraph(header, styles["ClauseHeader"])],
+                        [Paragraph(quote, styles["ClauseText"])],
+                    ],
+                    colWidths=[doc.width],
+                    repeatRows=1,
+                    splitByRow=1,
+                    splitInRow=1,
+                )
+                callout.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, -1), _MUTED_ROW),
+                    ("LINEBEFORE", (0, 0), (0, -1), 3, colors.HexColor("#2563EB")),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+                    ("TOPPADDING", (0, 0), (-1, -1), 7),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+                ]))
+                story.append(KeepTogether([callout, Spacer(1, 6)]))
+
+        story.append(_section_heading("Limitations", styles))
         story.append(Paragraph(
-            _text(f.get("limitations") or "Not provided."),
+            _text(_report_limitations(finding.get("limitations"))),
             styles["ReportBody"],
         ))
-        photo = f.get("photo_observation") or {}
+
+        photo = finding.get("photo_observation") or {}
         if photo:
-            if photo.get("mode") != "llm_analyzed":
-                story.append(Paragraph(
-                    "A photo pair is linked, but no successful vision-model observation is stored.",
-                    styles["SmallText"]
-                ))
-            else:
-                if photo.get("observation"):
-                    story.append(Paragraph(f"<b>Summary:</b> {_text(photo['observation'])[:1500]}", styles["SmallText"]))
-                story.append(Paragraph(
-                    f"<b>Comparability:</b> {_text(photo.get('comparable', 'not stated'))}; "
-                    f"same area visible in both: {_text(photo.get('same_area_visible_in_both', 'not stated'))}.",
-                    styles["SmallText"]
-                ))
-                for key, label in (("move_in_condition", "Move-in condition"), ("move_out_condition", "Move-out condition")):
-                    if photo.get(key):
-                        story.append(Paragraph(f"<b>{label}:</b> {_text(photo[key])[:1000]}", styles["SmallText"]))
-
-                changes = photo.get("observed_changes") or []
-                if changes:
-                    data = [[
-                        Paragraph("<b>Observed feature / location</b>", styles["SmallText"]),
-                        Paragraph("<b>Move-in condition</b>", styles["SmallText"]),
-                        Paragraph("<b>Move-out condition</b>", styles["SmallText"]),
-                        Paragraph("<b>Interpretation</b>", styles["SmallText"]),
-                    ]]
-                    for change in changes[:8]:
-                        feature = change.get("feature") or "Visible feature"
-                        if change.get("location"):
-                            feature += f" ({change['location']})"
-                        data.append([
-                            Paragraph(_text(feature)[:400], styles["SmallText"]),
-                            Paragraph(_text(change.get("move_in_condition") or "Not described")[:400], styles["SmallText"]),
-                            Paragraph(_text(change.get("move_out_condition") or "Not described")[:400], styles["SmallText"]),
-                            Paragraph(_text(change.get("interpretation") or "No interpretation provided")[:500], styles["SmallText"]),
-                        ])
-                    photo_table = Table(data, colWidths=[1.25*inch, 1.45*inch, 1.45*inch, 2.95*inch], repeatRows=1)
-                    photo_table.setStyle(TableStyle([
-                        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#E2E8F0")),
-                        ("GRID", (0,0), (-1,-1), 0.35, colors.HexColor("#CBD5E1")),
-                        ("VALIGN", (0,0), (-1,-1), "TOP"),
-                        ("PADDING", (0,0), (-1,-1), 4),
-                    ]))
-                    story.append(photo_table)
-                elif photo.get("visible_differences"):
-                    story.append(Paragraph(
-                        "<b>Observed changes:</b> " + _text("; ".join(photo["visible_differences"]))[:1200],
-                        styles["SmallText"]
-                    ))
-                    story.append(Paragraph(
-                        "The model did not provide separate move-in/move-out descriptions or locations.",
-                        styles["SmallText"]
-                    ))
-                else:
-                    story.append(Paragraph("<b>Observed changes:</b> No specific visible differences were reported.", styles["SmallText"]))
-
-                uncertainty = photo.get("model_uncertainty")
-                story.append(Paragraph(
-                    f"<b>Evidence strength / uncertainty:</b> Listed changes are model-reported visual comparisons; "
-                    f"possible-damage items are uncertain observations. Qualitative model uncertainty: "
-                    f"{_text(uncertainty or 'not provided')}; this is not a calibrated confidence score.",
-                    styles["SmallText"]
-                ))
-            possible_damage = photo.get("possible_damage_or_deterioration") or []
-            if possible_damage:
-                story.append(Paragraph(
-                    "<b>Possible damage (not a finding of responsibility):</b> " +
-                    _text("; ".join(possible_damage))[:1200],
-                    styles["SmallText"]
-                ))
-            if photo.get("not_reliably_comparable"):
-                story.append(Paragraph(
-                    "<b>Not reliably comparable:</b> " + _text("; ".join(photo["not_reliably_comparable"]))[:1000],
-                    styles["SmallText"]
-                ))
-            if photo.get("limitations"):
-                story.append(Paragraph(f"<b>Model-stated limitations:</b> {_text(photo['limitations'])[:1000]}", styles["SmallText"]))
-            story.append(Paragraph(
-                f"<b>Relevance to deduction:</b> This stored photo comparison concerns "
-                f"{_text(f.get('photo_item_name') or 'the linked photo item')}; it was not a deduction assessment. "
-                f"It may provide visual context for “{_text(f.get('description', 'the claim'))}”, but does not "
-                "establish that the claimed repair was required or its cost.",
-                styles["SmallText"]
-            ))
-            story.append(Paragraph(
-                "Photographs can show visible differences, but cannot independently establish when a change "
-                "occurred, who caused it, actual repair cost, or legal responsibility.",
-                styles["SmallText"]
-            ))
+            _append_photo_comparison(
+                story,
+                photo,
+                styles,
+                title="Photo Comparison",
+                finding=finding,
+            )
         else:
             story.append(Paragraph(
                 "No linked usable photo observation is available for this deduction.",
-                styles["SmallText"]
+                styles["SmallText"],
             ))
-        _append_repair_benchmark(story, f.get("repair_price_benchmark"), styles)
+
+        _append_repair_benchmark(story, finding.get("repair_price_benchmark"), styles)
         _append_repair_benchmark(
             story,
-            f.get("locality_benchmark"),
+            finding.get("locality_benchmark"),
             styles,
-            heading="Selected locality benchmark (context only; does not determine classification)",
+            heading="Locality Benchmark",
         )
-        if f.get("ai_error"):
+        if finding.get("ai_error"):
             story.append(Paragraph(
-                f"<b>Hosted AI unavailable:</b> {_text(f['ai_error'])[:1000]} (rules-based fallback used.)",
-                styles["SmallText"]
+                f"<b>Hosted AI unavailable:</b> {_text(finding['ai_error'])[:1000]} "
+                "(the evidence review was used as a fallback.)",
+                styles["SmallText"],
             ))
-        story.append(Spacer(1, 10))
+        story.append(Spacer(1, 8))
+
     if photo_pairs:
-        story.append(Paragraph("Saved photo comparisons not linked to a deduction", styles["Heading2"]))
+        story.append(_section_heading(
+            "Saved Photo Comparisons Not Linked to a Deduction",
+            styles,
+        ))
         story.append(Paragraph(
-            "These stored photo comparisons are not associated with a specific deduction and should not "
-            "be treated as evidence for a particular claim.",
-            styles["SmallText"]
+            "These stored photo comparisons are not associated with a specific deduction "
+            "and should not be treated as evidence for a particular claim.",
+            styles["ReportBody"],
         ))
         for pair in photo_pairs:
             photo = json.loads(pair["observation_json"]) if pair["observation_json"] else {
                 "mode": "not_analyzed",
                 "limitations": "No photo observation is stored.",
             }
-            story.append(Paragraph(
-                f"{_text(pair['item_name'])} — status: {_text(pair['status'])}",
-                styles["Heading3"]
-            ))
-            if photo.get("mode") != "llm_analyzed":
-                story.append(Paragraph(
-                    "No successful vision-model observation is stored. "
-                    + _text(photo.get("error") or photo.get("limitations") or "No analysis details available."),
-                    styles["SmallText"]
-                ))
-                continue
-            if photo.get("observation"):
-                story.append(Paragraph(f"<b>Summary:</b> {_text(photo['observation'])[:1500]}", styles["SmallText"]))
-            for key, label in (("move_in_condition", "Move-in condition"), ("move_out_condition", "Move-out condition")):
-                if photo.get(key):
-                    story.append(Paragraph(f"<b>{label}:</b> {_text(photo[key])[:1000]}", styles["SmallText"]))
-            changes = photo.get("observed_changes") or []
-            if changes:
-                data = [[
-                    Paragraph("<b>Observed feature / location</b>", styles["SmallText"]),
-                    Paragraph("<b>Move-in condition</b>", styles["SmallText"]),
-                    Paragraph("<b>Move-out condition</b>", styles["SmallText"]),
-                    Paragraph("<b>Interpretation</b>", styles["SmallText"]),
-                ]]
-                for change in changes[:8]:
-                    feature = change.get("feature") or "Visible feature"
-                    if change.get("location"):
-                        feature += f" ({change['location']})"
-                    data.append([
-                        Paragraph(_text(feature)[:400], styles["SmallText"]),
-                        Paragraph(_text(change.get("move_in_condition") or "Not described")[:400], styles["SmallText"]),
-                        Paragraph(_text(change.get("move_out_condition") or "Not described")[:400], styles["SmallText"]),
-                        Paragraph(_text(change.get("interpretation") or "No interpretation provided")[:500], styles["SmallText"]),
-                    ])
-                table = Table(data, colWidths=[1.25*inch, 1.45*inch, 1.45*inch, 2.95*inch], repeatRows=1)
-                table.setStyle(TableStyle([
-                    ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#E2E8F0")),
-                    ("GRID", (0,0), (-1,-1), 0.35, colors.HexColor("#CBD5E1")),
-                    ("VALIGN", (0,0), (-1,-1), "TOP"),
-                    ("PADDING", (0,0), (-1,-1), 4),
-                ]))
-                story.append(table)
-            elif photo.get("visible_differences"):
-                story.append(Paragraph(
-                    "<b>Observed changes:</b> " + _text("; ".join(photo["visible_differences"]))[:1200],
-                    styles["SmallText"]
-                ))
-            story.append(Paragraph(
-                f"<b>Comparability:</b> {_text(photo.get('comparable', 'not stated'))}; "
-                f"<b>qualitative uncertainty:</b> {_text(photo.get('model_uncertainty', 'not provided'))} "
-                "(not a calibrated score).",
-                styles["SmallText"]
-            ))
-            if photo.get("limitations"):
-                story.append(Paragraph(f"<b>Limitations:</b> {_text(photo['limitations'])[:1000]}", styles["SmallText"]))
-            story.append(Paragraph(
-                "Photographs show visible differences only; they cannot independently establish timing, "
-                "cause, repair cost, or legal responsibility.",
-                styles["SmallText"]
-            ))
+            _append_photo_comparison(
+                story,
+                photo,
+                styles,
+                title=_title_case(pair["item_name"]),
+            )
+
     story += [
-        Spacer(1, 12),
-        Paragraph("Disclaimer", styles["Heading3"]),
+        Spacer(1, 8),
+        _section_heading("Disclaimer", styles),
         Paragraph(
-            "This report combines rules-based evidence classifications with hosted-model explanations "
-            "or photo comparisons only where explicitly indicated. It is not legal advice, "
-            "a legal judgment, or a guarantee of refund. Missing documentation does not by itself "
-            "prove a claim is invalid. Review original documents and seek qualified advice where appropriate.",
-            styles["SmallText"]
-        )
+            "This report summarizes evidence classifications and includes hosted-model "
+            "explanations or photo comparisons only where explicitly indicated. It is not "
+            "legal advice, a legal judgment, or a guarantee of refund. Missing documentation "
+            "does not by itself prove a claim is invalid. Review original documents and seek "
+            "qualified advice where appropriate.",
+            styles["ReportBody"],
+        ),
     ]
     doc.build(story)
     return str(path)

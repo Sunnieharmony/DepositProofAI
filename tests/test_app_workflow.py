@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -34,6 +35,43 @@ class AppWorkflowTests(unittest.TestCase):
     def _restore_paths(self):
         app.DB_PATH, app.UPLOADS, app.REPORTS = self.original_paths
 
+    def test_local_launch_uses_loopback_and_opens_browser(self):
+        with patch.dict(os.environ, {}, clear=True):
+            launch_kwargs = app._launch_kwargs()
+
+        self.assertEqual(launch_kwargs["server_name"], "127.0.0.1")
+        self.assertEqual(launch_kwargs["server_port"], 7860)
+        self.assertTrue(launch_kwargs["inbrowser"])
+
+    def test_hosted_launch_uses_all_interfaces_without_opening_browser(self):
+        for environment, expected_port in (
+            ({"RENDER": "true"}, 7860),
+            ({"PORT": "7861"}, 7861),
+        ):
+            with self.subTest(environment=environment), patch.dict(
+                os.environ, environment, clear=True
+            ):
+                launch_kwargs = app._launch_kwargs()
+
+            self.assertEqual(launch_kwargs["server_name"], "0.0.0.0")
+            self.assertEqual(launch_kwargs["server_port"], expected_port)
+            self.assertNotIn("inbrowser", launch_kwargs)
+
+    def test_ai_status_names_missing_provider_key_without_showing_credentials(self):
+        with patch.dict(os.environ, {
+            "LLM_PROVIDER": "google",
+            "GEMINI_API_KEY": "",
+            "GOOGLE_API_KEY": "",
+            "LLM_API_KEY": "",
+            "HF_TOKEN": "",
+        }, clear=True), patch.object(app, "llm_is_configured", return_value=False):
+            message = app.ai_status_markdown()
+
+        self.assertIn("LLM_PROVIDER", message)
+        self.assertIn("google", message)
+        self.assertIn("GEMINI_API_KEY", message)
+        self.assertNotIn("demo-google-key", message)
+
     def _add_deduction(self, deduction_id, description, photo_pair_id=None):
         with app.db() as con:
             con.execute(
@@ -59,7 +97,7 @@ class AppWorkflowTests(unittest.TestCase):
     def test_navigation_opens_sections_without_a_case(self):
         evidence_state = app._navigate_to_step(2, None, None)
         self.assertEqual([item["visible"] for item in evidence_state[:4]], [False, True, False, False])
-        self.assertIn("Create or select an audit case", evidence_state[8])
+        self.assertIn("Create an audit case", evidence_state[8])
         self.assertIn("still explore", evidence_state[8])
         self.assertIn("dp-step--active", evidence_state[5]["elem_classes"])
 
@@ -83,7 +121,7 @@ class AppWorkflowTests(unittest.TestCase):
     def test_continue_navigation_does_not_require_a_saved_case(self):
         missing_state = app._continue_from_case(None)
         self.assertEqual([item["visible"] for item in missing_state[:4]], [False, True, False, False])
-        self.assertIn("Create or select an audit case", missing_state[8])
+        self.assertIn("Create an audit case", missing_state[8])
         findings_state_without_case = app._continue_from_evidence(None)
         self.assertEqual(
             [item["visible"] for item in findings_state_without_case[:4]],
@@ -116,60 +154,197 @@ class AppWorkflowTests(unittest.TestCase):
             [False, False, True, False],
         )
 
-    def test_local_draft_only_resumes_a_case_present_in_the_database(self):
-        empty_id, hidden_resume = app.prepare_local_draft("")
-        self.assertEqual(empty_id, "")
-        self.assertFalse(hidden_resume["visible"])
-
-        draft_id, visible_resume = app.prepare_local_draft(self.case_id)
-        self.assertEqual(draft_id, self.case_id)
-        self.assertTrue(visible_resume["visible"])
-
-        missing_id, hidden_missing_resume = app.prepare_local_draft("MISSING001")
-        self.assertEqual(missing_id, "")
-        self.assertFalse(hidden_missing_resume["visible"])
-
-        loaded_case, _, message = app.load_selected_case(self.case_id)
-        self.assertEqual(loaded_case, self.case_id)
-        self.assertIn(self.case_id, message)
-        missing_case, _, missing_message = app.load_selected_case("MISSING001")
-        self.assertEqual(missing_case, "")
-        self.assertIn("could not be found", missing_message)
-
-    def test_ui_uses_browser_storage_instead_of_a_global_case_dropdown(self):
+    def test_ui_removes_resume_and_exposes_primary_and_optional_documents(self):
         config = app.demo.config
-        self.assertFalse(any(
-            component.get("props", {}).get("label") == "Saved cases"
-            for component in config.get("components", [])
-        ))
+        components = config.get("components", [])
+        buttons = {
+            component.get("props", {}).get("value")
+            for component in components
+            if component.get("type") == "button"
+        }
+        self.assertNotIn("Resume", buttons)
+        self.assertNotIn("Back to case", buttons)
+        self.assertNotIn("Review agreement details with hosted model", buttons)
+        self.assertNotIn("Repair Price Intelligence", buttons)
+        self.assertFalse(any(component.get("type") == "accordion" for component in components))
+
+        by_label = {
+            component.get("props", {}).get("label"): component.get("props", {})
+            for component in components
+            if component.get("props", {}).get("label")
+        }
+        self.assertEqual(
+            by_label["Primary lease/agreement document"].get("file_count"), "single"
+        )
+        self.assertEqual(
+            by_label["Optional additional documents"].get("file_count"), "multiple"
+        )
+        self.assertFalse(by_label["Optional additional documents"].get("visible", True))
+        self.assertEqual(by_label["Choose move-in photo"].get("file_count"), "single")
+        self.assertEqual(by_label["Choose move-out photo"].get("file_count"), "single")
+        self.assertIn("dp-loading-overlay", json.dumps(config))
+        self.assertIn("Analyzing evidence &amp; generating report", json.dumps(config))
+
         scripts = [
             dependency.get("js") or ""
             for dependency in config.get("dependencies", [])
         ]
-        self.assertTrue(any(
-            app.ACTIVE_DRAFT_STORAGE_KEY in script and "getItem" in script
-            for script in scripts
-        ))
-        self.assertTrue(any(
-            app.ACTIVE_DRAFT_STORAGE_KEY in script and "setItem" in script
-            for script in scripts
-        ))
-        labels = {
-            component.get("props", {}).get("label")
-            for component in config.get("components", [])
-        }
+        self.assertFalse(any("localStorage" in script for script in scripts))
+        self.assertGreaterEqual(scripts.count(app.SCROLL_TO_TOP_JS), 9)
+        self.assertEqual(scripts.count(app.SHOW_LOADING_JS), 3)
+        self.assertEqual(scripts.count(app.HIDE_LOADING_JS), 3)
+        self.assertIn("position: fixed", app.APP_CSS)
+        self.assertIn("z-index: 9999", app.APP_CSS)
+
+        labels = set(by_label)
         self.assertNotIn("Associated invoice (optional)", labels)
         self.assertNotIn("Associated photo pair (optional)", labels)
         self.assertNotIn("Deduction to update", labels)
+        self.assertNotIn("Compare with sample rates", buttons)
+
+    def test_city_and_area_dropdowns_have_valid_defaults_and_cascade(self):
+        config = app.demo.get_config_file()
+        by_label = {
+            component.get("props", {}).get("label"): component.get("props", {})
+            for component in config["components"]
+            if component.get("props", {}).get("label")
+        }
+        expected_cities = sorted(
+            app.LOCALITY_DATA["City"].dropna().unique(), key=str.casefold
+        )
+        expected_areas = sorted(
+            app.LOCALITY_DATA.loc[
+                app.LOCALITY_DATA["City"] == app.DEFAULT_CITY, "Locality / Area"
+            ].dropna().unique(),
+            key=str.casefold,
+        )
+        self.assertEqual(
+            [choice[1] for choice in by_label["City"]["choices"]], expected_cities
+        )
+        self.assertEqual(by_label["City"]["value"], app.DEFAULT_CITY)
+        self.assertEqual(
+            [choice[1] for choice in by_label["Area / Locality"]["choices"]],
+            expected_areas,
+        )
+        self.assertEqual(by_label["Area / Locality"]["value"], app.DEFAULT_AREA)
+        self.assertEqual(
+            app.locality_selection_from_values(app.DEFAULT_CITY, app.DEFAULT_AREA),
+            f"{app.DEFAULT_AREA}, {app.DEFAULT_CITY}",
+        )
+
+        other_city = next(city for city in app.CITY_CHOICES if city != app.DEFAULT_CITY)
+        area_update = app.update_locality_choices(other_city)
+        self.assertEqual(
+            area_update["choices"], app.LOCALITY_CHOICES_BY_CITY[other_city]
+        )
+        self.assertEqual(area_update["value"], app.LOCALITY_CHOICES_BY_CITY[other_city][0])
+
+        dependencies = config["dependencies"]
+        cascade_event = next(
+            event for event in dependencies
+            if event.get("api_name") == "update_locality_choices"
+        )
+        audit_event = next(
+            event for event in dependencies
+            if event.get("api_name") == "_run_audit_for_workflow"
+        )
+        self.assertEqual((len(cascade_event["inputs"]), len(cascade_event["outputs"])), (1, 1))
+        self.assertEqual(len(audit_event["inputs"]), 3)
+
+    def test_create_case_saves_optional_dates_and_rejects_reversed_order(self):
+        empty_case_id, _ = app.create_case(
+            "Undated property", 10000, 500, None, "", None,
+        )
+        with app.db() as con:
+            empty_dates = con.execute(
+                "SELECT move_in,move_out FROM cases WHERE id=?", (empty_case_id,)
+            ).fetchone()
+        self.assertEqual((empty_dates["move_in"], empty_dates["move_out"]), (None, None))
+
+        dated_case_id, _ = app.create_case(
+            "Dated property", 10000, 500, None, "2025-03-01", "2025-03-12",
+        )
+        with app.db() as con:
+            saved_dates = con.execute(
+                "SELECT move_in,move_out FROM cases WHERE id=?", (dated_case_id,)
+            ).fetchone()
+            case_count = con.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+        self.assertEqual(
+            (saved_dates["move_in"], saved_dates["move_out"]),
+            ("2025-03-01", "2025-03-12"),
+        )
+
+        with self.assertRaisesRegex(app.gr.Error, "Move-out date cannot be earlier"):
+            app.create_case(
+                "Invalid dates", 10000, 500, None, "2025-03-12", "2025-03-01",
+            )
+        with app.db() as con:
+            final_case_count = con.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+        self.assertEqual(final_case_count, case_count)
+
+    def test_case_date_validation_updates_for_both_selected_dates(self):
+        self.assertFalse(app.validate_case_dates(None, None)["visible"])
+        invalid = app.validate_case_dates("2025-03-12", "2025-03-01")
+        self.assertTrue(invalid["visible"])
+        self.assertIn("Move-out date cannot be earlier", invalid["value"])
+        self.assertFalse(app.validate_case_dates("2025-03-01", "2025-03-12")["visible"])
+
+    def test_date_picker_components_and_live_validation_events(self):
+        config = app.demo.config
+        components = config.get("components", [])
+        date_labels = {"Move-in date (optional)", "Move-out date (optional)"}
+        date_components = {
+            component.get("props", {}).get("label"): component
+            for component in components
+            if component.get("props", {}).get("label") in date_labels
+        }
+        self.assertEqual(set(date_components), date_labels)
+        for component in date_components.values():
+            self.assertEqual(component.get("type"), "datetime")
+            self.assertFalse(component["props"].get("include_time"))
+            self.assertEqual(component["props"].get("type"), "string")
+        date_component_ids = {component["id"] for component in date_components.values()}
+        validation_component_ids = {
+            component["id"]
+            for component in components
+            if "dp-date-validation" in component.get("props", {}).get("elem_classes", [])
+        }
+        self.assertEqual(len(validation_component_ids), 1)
+        date_validation_id = next(iter(validation_component_ids))
+        date_change_dependencies = [
+            dependency
+            for dependency in config.get("dependencies", [])
+            if date_validation_id in dependency.get("outputs", [])
+        ]
+        self.assertEqual(len(date_change_dependencies), 2)
+        self.assertTrue(
+            all(
+                set(dependency["inputs"]) == date_component_ids
+                for dependency in date_change_dependencies
+            )
+        )
+        self.assertEqual(
+            {
+                target[0]
+                for dependency in date_change_dependencies
+                for target in dependency["targets"]
+            },
+            date_component_ids,
+        )
+        self.assertTrue(
+            all(
+                target[1] == "change"
+                for dependency in date_change_dependencies
+                for target in dependency["targets"]
+            )
+        )
 
     def test_case_summary_displays_complete_id_without_model_configuration(self):
         with patch.object(app, "llm_is_configured", return_value=True):
-            case_id, summary, saved_draft_id, resume_update = app.create_case(
+            case_id, summary = app.create_case(
                 "Visible case", 10000, 1000, 9000, None, None,
             )
 
-        self.assertEqual(saved_draft_id, case_id)
-        self.assertTrue(resume_update["visible"])
         self.assertIn(
             f'<h3>Case created: <span class="dp-case-id">{case_id}</span></h3>',
             summary,
@@ -178,11 +353,19 @@ class AppWorkflowTests(unittest.TestCase):
         for internal_detail in ("gemini", "flash", "vision:", "language:", "API key", "sentence-transformers"):
             self.assertNotIn(internal_detail.lower(), summary.lower())
 
-        with patch.object(app, "llm_is_configured", return_value=False):
+        with patch.dict(os.environ, {
+            "LLM_PROVIDER": "google",
+            "GEMINI_API_KEY": "",
+            "GOOGLE_API_KEY": "",
+            "LLM_API_KEY": "",
+            "HF_TOKEN": "",
+        }, clear=True), patch.object(app, "llm_is_configured", return_value=False):
             status = app.ai_status_markdown()
         self.assertIn("AI-assisted analysis is unavailable", status)
         self.assertIn("rules-based assessment remains available", status)
-        self.assertNotIn("API key", status)
+        self.assertIn("LLM_PROVIDER", status)
+        self.assertIn("GEMINI_API_KEY", status)
+        self.assertNotIn("demo-google-key", status)
 
     def test_final_report_navigation_shows_guidance_without_blocking(self):
         report_state = app._continue_from_review("")
@@ -231,7 +414,9 @@ class AppWorkflowTests(unittest.TestCase):
         self.assertEqual(deduction["photo_pair_id"], pair["id"])
 
     def test_invoice_upload_automatically_links_to_an_existing_deduction(self):
+        primary = Path(self.temp_dir.name) / "rental-agreement.pdf"
         source = Path(self.temp_dir.name) / "painting-invoice.pdf"
+        primary.write_bytes(b"agreement fixture")
         source.write_bytes(b"fixture")
         app.add_deduction(
             self.case_id, "Painting / repainting", "Repainting living room", 500,
@@ -244,11 +429,15 @@ class AppWorkflowTests(unittest.TestCase):
             return_value={"total_amount": 500, "service_description": "Painting work"},
         ):
             result, _ = app.upload_documents(
-                self.case_id, [str(source)], "Invoice / receipt",
+                self.case_id, str(primary), [str(source)], "Invoice / receipt",
             )
 
         self.assertIn("painting-invoice.pdf", result)
         with app.db() as con:
+            primary_document = con.execute(
+                "SELECT category FROM documents WHERE filename=?",
+                ("rental-agreement.pdf",),
+            ).fetchone()
             deduction = con.execute(
                 "SELECT invoice_document_id FROM deductions WHERE case_id=?",
                 (self.case_id,),
@@ -257,7 +446,23 @@ class AppWorkflowTests(unittest.TestCase):
                 "SELECT filename FROM documents WHERE id=?",
                 (deduction["invoice_document_id"],),
             ).fetchone()
+        self.assertEqual(primary_document["category"], "Rental agreement")
         self.assertEqual(invoice["filename"], "painting-invoice.pdf")
+
+    def test_document_upload_requires_a_primary_agreement(self):
+        with self.assertRaisesRegex(app.gr.Error, "primary lease/agreement"):
+            app.upload_documents(self.case_id, None, [], "Other document")
+
+    def test_additional_documents_toggle_shows_and_hides_optional_uploader(self):
+        visible, panel_update, button_update = app.toggle_additional_documents(False)
+        self.assertTrue(visible)
+        self.assertTrue(panel_update["visible"])
+        self.assertEqual(button_update["value"], "- Hide Optional Additional Documents")
+
+        visible, panel_update, button_update = app.toggle_additional_documents(True)
+        self.assertFalse(visible)
+        self.assertFalse(panel_update["visible"])
+        self.assertEqual(button_update["value"], "+ Add Optional Additional Documents")
 
     def test_photo_upload_shows_clear_error_when_analysis_fails(self):
         root = Path(self.temp_dir.name)
@@ -338,7 +543,7 @@ class AppWorkflowTests(unittest.TestCase):
         self.assertEqual(saved_finding["locality_benchmark"]["difference"], 600)
         self.assertEqual(saved_finding["classification"], "Insufficiently Documented")
 
-    def test_saved_price_benchmark_is_reported_without_changing_classification(self):
+    def test_audit_automatically_reports_price_benchmark_without_changing_classification(self):
         with app.db() as con:
             con.execute(
                 """INSERT INTO deductions(id,case_id,category,description,amount,created_at)
@@ -346,86 +551,91 @@ class AppWorkflowTests(unittest.TestCase):
                 ("BENCHMARK01", self.case_id, "Painting / repainting",
                  "Repainting a 1BHK", 10000, "2025-01-01T00:00:00"),
             )
-        output = app.run_repair_price_comparison(
-            self.case_id,
-            "BENCHMARK01 — Repainting a 1BHK (₹10,000)",
-            "Painting / Repainting",
-            10000,
-            "Bengaluru",
-            "HSR Layout",
-            False,
-        )
-        self.assertIn("Saved to this deduction", output)
-        self.assertIn("8,800", output)
-        self.assertIn("15,400", output)
-
         rules_result = {
             "classification": "Inconsistent",
             "explanation": "The rules identified a contradiction in the evidence.",
         }
         with patch.object(app, "llm_is_configured", return_value=False), \
                 patch.object(app, "classify_deduction", return_value=rules_result):
-            markdown, pdf_path, _ = app.run_audit(self.case_id)
-            app.run_audit(self.case_id)
+            markdown, pdf_path, _ = app.run_audit(
+                self.case_id, "HSR Layout, Bengaluru"
+            )
 
         self.assertIn("### Repair-price benchmark — context only", markdown)
+        self.assertIn("Damage cause: Repainting a 1BHK", markdown)
+        self.assertIn("Area: HSR Layout, Bengaluru", markdown)
+        self.assertIn("Sample range: ₹8,800–₹15,400", markdown)
+        self.assertIn("Matched sample rates", markdown)
         self.assertIn("Sample repair-rate data only", markdown)
         self.assertTrue(Path(pdf_path).is_file())
         pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(pdf_path).pages)
-        self.assertIn("Repair-price benchmark", pdf_text)
+        self.assertIn("Repair Price Intelligence Benchmark", pdf_text)
+        self.assertIn("For Repainting a 1BHK, the claimed amount", pdf_text)
+        self.assertIn("Bengaluru, HSR Layout", pdf_text)
+        self.assertIn("INR 8,800.00 to INR 15,400.00", pdf_text)
         self.assertIn("Sample repair-rate data only", pdf_text)
         with app.db() as con:
             finding = con.execute(
                 "SELECT finding_json FROM findings WHERE deduction_id=?",
                 ("BENCHMARK01",),
             ).fetchone()
-            benchmark_count = con.execute(
-                "SELECT COUNT(*) FROM repair_benchmarks WHERE deduction_id=?",
-                ("BENCHMARK01",),
-            ).fetchone()[0]
         saved_finding = json.loads(finding["finding_json"])
         self.assertEqual(saved_finding["classification"], "Inconsistent")
-        self.assertEqual(saved_finding["repair_price_benchmark"]["position"], "within")
-        self.assertEqual(benchmark_count, 1)
+        benchmark = saved_finding["repair_price_benchmark"]
+        self.assertEqual(benchmark["status"], "matched")
+        self.assertEqual(benchmark["position"], "within")
+        self.assertEqual(benchmark["damage_cause"], "Repainting a 1BHK")
+        self.assertEqual(benchmark["area"], "HSR Layout")
+        self.assertEqual(benchmark["matched_records"][0]["category"], "Painting / Repainting")
 
-    def test_gemini_benchmark_failure_keeps_deterministic_result(self):
-        with patch.object(app, "explain_repair_benchmark_with_llm", return_value=None), \
-                patch.object(app, "get_last_error", return_value="Gemini quota exhausted"):
-            output = app.run_repair_price_comparison(
-                None, "None", "Painting / Repainting", 16000,
-                "Bengaluru", "HSR Layout", True,
+    def test_pdf_benchmark_explains_claim_below_the_local_sample_range(self):
+        with app.db() as con:
+            con.execute(
+                "UPDATE cases SET claimed_deductions=? WHERE id=?",
+                (1000, self.case_id),
+            )
+            con.execute(
+                """INSERT INTO deductions(id,case_id,category,description,amount,created_at)
+                   VALUES(?,?,?,?,?,?)""",
+                ("BENCHMARK_BELOW", self.case_id, "Painting / repainting",
+                 "Repainting the living room", 1000, "2025-01-01T00:00:00"),
             )
 
-        self.assertIn("Deterministic explanation", output)
-        self.assertIn("Hosted-model explanation was not used", output)
-        self.assertIn("Gemini quota exhausted", output)
-        self.assertIn("above the matched sample range", output)
+        with patch.object(app, "llm_is_configured", return_value=False):
+            _, pdf_path, _ = app.run_audit(self.case_id, "HSR Layout, Bengaluru")
 
-    def test_claim_amount_mismatch_does_not_attach_benchmark_to_deduction(self):
+        pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(pdf_path).pages)
+        normalized_pdf_text = " ".join(pdf_text.split())
+        self.assertIn(
+            "For Repainting the living room, the claimed amount of INR 1,000.00 is "
+            "88.6% below the typical Bengaluru, HSR Layout range for Painting / "
+            "Repainting of INR 8,800.00 to INR 15,400.00",
+            normalized_pdf_text,
+        )
+
+    def test_automatic_price_benchmark_reports_unmapped_damage_category(self):
         with app.db() as con:
             con.execute(
                 """INSERT INTO deductions(id,case_id,category,description,amount,created_at)
                    VALUES(?,?,?,?,?,?)""",
-                ("BENCHMARK02", self.case_id, "Painting / repainting",
-                 "Repainting a 1BHK", 10000, "2025-01-01T00:00:00"),
+                ("BENCHMARK02", self.case_id, "Structural damage",
+                 "Repairing a cracked support wall", 10000, "2025-01-01T00:00:00"),
             )
-        output = app.run_repair_price_comparison(
-            self.case_id,
-            "BENCHMARK02 — Repainting a 1BHK (₹10,000)",
-            "Painting / Repainting",
-            12000,
-            "Bengaluru",
-            "HSR Layout",
-            False,
-        )
+        with patch.object(app, "llm_is_configured", return_value=False):
+            markdown, _, _ = app.run_audit(
+                self.case_id, "HSR Layout, Bengaluru"
+            )
 
-        self.assertIn("does not match the saved deduction amount", output)
+        self.assertIn("Cost comparison unavailable", markdown)
+        self.assertIn("No sample-rate category is mapped to the Structural damage deduction type", markdown)
         with app.db() as con:
-            count = con.execute(
-                "SELECT COUNT(*) FROM repair_benchmarks WHERE deduction_id=?",
+            finding = con.execute(
+                "SELECT finding_json FROM findings WHERE deduction_id=?",
                 ("BENCHMARK02",),
-            ).fetchone()[0]
-        self.assertEqual(count, 0)
+            ).fetchone()
+        benchmark = json.loads(finding["finding_json"])["repair_price_benchmark"]
+        self.assertEqual(benchmark["status"], "no_match")
+        self.assertEqual(benchmark["damage_cause"], "Repairing a cracked support wall")
 
     def test_audit_verifies_retrieved_quotes_against_the_agreement_source(self):
         agreement_text = "Tenant must pay for repainting due to tenant-caused damage beyond ordinary wear."
@@ -560,15 +770,18 @@ class AppWorkflowTests(unittest.TestCase):
         self.assertNotIn("Rules-based assessment of the uploaded evidence only.", markdown)
 
         pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(pdf_path).pages)
-        self.assertIn("Assessment modes by deduction", pdf_text)
-        self.assertIn("LLM explanation with rules-engine classification", pdf_text)
-        self.assertIn("rules-based fallback after LLM failure", pdf_text)
+        self.assertNotIn("Assessment modes by deduction", pdf_text)
+        self.assertNotIn("rules-engine classification", pdf_text)
+        self.assertNotIn("rules engine", pdf_text.lower())
+        self.assertIn("INR 9,750.00", pdf_text)
         self.assertIn("Observed feature", pdf_text)
         self.assertIn("location", pdf_text)
         self.assertIn("Near", pdf_text)
         self.assertIn("baseboard", pdf_text)
         self.assertIn("No linked usable photo observation", pdf_text)
-        self.assertNotIn("Photo comparison", pdf_text)
+        self.assertIn("Photo Comparison", pdf_text)
+        self.assertIn("Visual Match: Verified", pdf_text)
+        self.assertNotIn("Comparability:", pdf_text)
         self.assertNotIn("AI suggestion", pdf_text)
 
     def test_final_report_formats_passages_and_omits_private_evidence_and_invoice_details(self):
@@ -650,10 +863,9 @@ class AppWorkflowTests(unittest.TestCase):
             "rules_classification": "Insufficiently Documented",
             "llm_classification_suggestion": "Supported",
             "explanation": (
-                "The claim is not sufficiently documented.\n\n"
-                + "The rules-engine classification remains authoritative. "
-                + "Explanation detail. " * 300
-                + "EXPLANATION_END_MARKER"
+                "The claimed repair cost is not sufficiently documented because no dated "
+                "invoice was provided. The verified agreement clause addresses tenant "
+                "responsibility for damage but does not establish this amount."
             ),
             "evidence_reviewed": "PRIVATE_REVIEWED_VALUE",
             "missing_or_conflicting_evidence": "PRIVATE_MISSING_VALUE",
@@ -673,7 +885,6 @@ class AppWorkflowTests(unittest.TestCase):
         self.assertIn("### Relevant agreement passages", markdown)
         self.assertIn("Source document:</strong> rental-agreement.pdf", markdown)
         self.assertIn("CLAUSE_END_MARKER", markdown)
-        self.assertIn("EXPLANATION_END_MARKER", markdown)
         self.assertIn("Page:</strong> 3", markdown)
         self.assertIn("Quotation verification:</strong> Verified", markdown)
         self.assertIn("Quotation verification:</strong> Not verified", markdown)
@@ -693,20 +904,25 @@ class AppWorkflowTests(unittest.TestCase):
 
         pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(pdf_path).pages)
         self.assertGreater(len(PdfReader(pdf_path).pages), 1)
-        self.assertIn("01 — Painting wall due to wear and tear", pdf_text)
-        self.assertIn("Claimed amount", pdf_text)
-        self.assertIn("Final classification", pdf_text)
-        self.assertIn("Assessment method", pdf_text)
-        self.assertIn("Rules-engine classification", pdf_text)
-        self.assertIn("The rules-engine classification remains authoritative.", pdf_text)
+        self.assertIn("DepositProof AI", pdf_text)
+        self.assertIn("01 - Painting Wall Due To Wear And Tear", pdf_text)
+        self.assertIn("Security Deposit", pdf_text)
+        self.assertIn("Total Claimed", pdf_text)
+        self.assertIn("Verified Deductions", pdf_text)
+        self.assertIn("Recommended Refund", pdf_text)
+        self.assertIn("Unitemized claimed balance: INR 250.00", pdf_text)
+        self.assertIn("Executive Takeaway", pdf_text)
+        self.assertNotIn("Final classification", pdf_text)
+        self.assertNotIn("Assessment method", pdf_text)
+        self.assertNotIn("Rules-engine classification", pdf_text)
+        self.assertIn("The claimed repair cost is not sufficiently documented", pdf_text)
         self.assertIn("CLAUSE_END_MARKER", pdf_text)
-        self.assertIn("EXPLANATION_END_MARKER", pdf_text)
         self.assertIn("rental-agreement.pdf", pdf_text)
         self.assertIn("The landlord must provide an itemized statement.", pdf_text)
-        self.assertIn("Quotation verification: Verified", pdf_text)
-        self.assertIn("Quotation verification: Not verified", pdf_text)
+        self.assertIn("Clause Verified", pdf_text)
+        self.assertIn("Clause Not Verified", pdf_text)
         self.assertNotIn("AI suggestion", pdf_text)
-        self.assertNotIn("Photo comparison", pdf_text)
+        self.assertIn("Photo Comparison", pdf_text)
         self.assertNotIn("Evidence reviewed", pdf_text)
         self.assertNotIn("Missing or conflicting evidence", pdf_text)
         self.assertNotIn("PRIVATE_REVIEWED_VALUE", pdf_text)
@@ -763,7 +979,7 @@ class AppWorkflowTests(unittest.TestCase):
         self.assertIsNone(json.loads(finding["finding_json"])["photo_observation"])
 
         pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(pdf_path).pages)
-        self.assertIn("Saved photo comparisons not linked to a deduction", pdf_text)
+        self.assertIn("Saved Photo Comparisons Not Linked to a Deduction", pdf_text)
         self.assertIn("A chipped area is visible in the move-out photograph.", pdf_text)
         self.assertIn("not associated with a specific deduction", pdf_text)
 
